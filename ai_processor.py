@@ -3,13 +3,13 @@ from openai import OpenAI
 
 # DeepSeek client (uses OpenAI compatible base URL)
 deepseek_client = OpenAI(
-    api_key=os.getenv("sk-2404532f781f443a9c30ad807dd14b34"),
+    api_key=os.getenv("DEEPSEEK_API_KEY"),
     base_url="https://api.deepseek.com/v1"
 )
 
 # OpenAI client for DALL-E
 openai_client = OpenAI(
-    api_key=os.getenv("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")
+    api_key=os.getenv("OPENAI_API_KEY")
 )
 
 async def rewrite_text(original_text: str) -> str:
