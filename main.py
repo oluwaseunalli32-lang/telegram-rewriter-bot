@@ -16,10 +16,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # === CONFIG ===
-BOT_TOKEN = os.getenv("8827684962:AAGP_QRiJPhW7rULCzOcCXkae7vM1NIYqSQ")
-API_ID = int(os.getenv("36452297"))
-API_HASH = os.getenv("503bce47a92d2e8401ce49827e0fe89d")
-PHONE = os.getenv("+2348066415489")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+PHONE = os.getenv("PHONE_NUMBER")
 
 # Initialize the Bot (for posting to target channels)
 bot = Bot(token=BOT_TOKEN)
