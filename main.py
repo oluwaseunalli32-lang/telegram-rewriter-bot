@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+from pathlib import Path
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from aiogram import Bot
@@ -9,7 +10,16 @@ from aiogram.exceptions import TelegramAPIError
 import database
 from ai_processor import rewrite_text, generate_image
 
-load_dotenv()
+# === Force load .env from the same folder as this script ===
+env_path = Path(__file__).parent / '.env'
+load_dotenv(dotenv_path=env_path)
+
+# === DEBUG: Print keys (remove after confirming they work) ===
+print("OPENAI_API_KEY:", os.getenv("OPENAI_API_KEY"))
+print("DEEPSEEK_API_KEY:", os.getenv("DEEPSEEK_API_KEY"))
+print("BOT_TOKEN:", os.getenv("BOT_TOKEN"))
+print("API_ID:", os.getenv("API_ID"))
+print("PHONE_NUMBER:", os.getenv("PHONE_NUMBER"))
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -17,9 +27,14 @@ logger = logging.getLogger(__name__)
 
 # === CONFIG ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-API_ID = int(os.getenv("API_ID"))
+API_ID = int(os.getenv("API_ID")) if os.getenv("API_ID") else 0
 API_HASH = os.getenv("API_HASH")
 PHONE = os.getenv("PHONE_NUMBER")
+
+# Sanity check
+if not BOT_TOKEN or not API_ID or not API_HASH or not PHONE:
+    logger.error("Missing environment variables! Check .env file.")
+    exit(1)
 
 # Initialize the Bot (for posting to target channels)
 bot = Bot(token=BOT_TOKEN)
@@ -86,7 +101,7 @@ async def main():
     logger.info("User client connected!")
     
     # (Optional) Add a test client entry to the DB – remove this later!
-    # You can uncomment and run once to register your test channels.
+    # Uncomment the line below to register a test client.
     # database.add_client(source_channel_id=-1001234567890, target_channel_id=-1009876543210)
     
     logger.info("Bot is running. Listening for channel messages...")
