@@ -75,9 +75,8 @@ async def main():
     await user_client.start(phone=PHONE)
     logger.info("User client connected!")
 
-    # ✅ REGISTER YOUR CLIENT HERE (Source: CAPPERS FREE, Target: Caps_picks)
-    # This line adds the mapping to the database. Run once, then comment it out.
-    database.add_client(source_channel_id=-1003593544389, target_channel_id=-1004415621706)
+    # ✅ To add a client, uncomment the line below, replace IDs, run locally once, then re‑comment.
+    # database.add_client(source_channel_id=-1003593544389, target_channel_id=-1004415621706)
 
     logger.info("Bot is running. Listening for channel messages...")
     await user_client.run_until_disconnected()
