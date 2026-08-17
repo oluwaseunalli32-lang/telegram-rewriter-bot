@@ -1,5 +1,13 @@
+# Secret keys - NEVER upload these!
 .env
-session_name.session
-__pycache__/
+
+# Telethon session files (your login session)
+*.session
+
+# Database files
 *.db
 *.sqlite3
+
+# Python cache
+__pycache__/
+*.pyc
