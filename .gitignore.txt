@@ -2,7 +2,6 @@
 .env
 
 # Telethon session files (your login session)
-*.session
 
 # Database files
 *.db
