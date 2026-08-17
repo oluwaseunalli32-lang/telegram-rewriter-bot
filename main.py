@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 env_path = Path(__file__).parent / '.env'
 load_dotenv(dotenv_path=env_path)
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 import database
@@ -28,56 +28,64 @@ if not BOT_TOKEN or not API_ID or not API_HASH or not PHONE:
 bot = Bot(token=BOT_TOKEN)
 user_client = TelegramClient('session_name', API_ID, API_HASH)
 
-# === DEBUG: Log ALL incoming messages ===
-@user_client.on(events.NewMessage)
-async def debug_all_messages(event):
-    logger.info(f"📩 Received message from chat ID: {event.chat_id}, is_channel: {event.is_channel}")
-    # Now process only channel messages
-    if not event.is_channel:
-        return
-    
-    source_channel_id = event.chat_id
-    logger.info(f"🔍 Channel post detected in {source_channel_id}")
-    
-    target_channel_id = database.get_target_for_source(source_channel_id)
-    if not target_channel_id:
-        logger.info(f"❌ No mapping found for source {source_channel_id}")
-        return
-    
-    logger.info(f"✅ Forwarding post from {source_channel_id} to {target_channel_id}")
-    try:
-        original_text = event.message.text or event.message.caption or ""
-        rewritten_text = await rewrite_text(original_text)
-        image_url = None
-        if rewritten_text and len(rewritten_text) > 10:
-            image_url = await generate_image(rewritten_text)
-        if image_url:
-            await bot.send_photo(
-                chat_id=target_channel_id,
-                photo=image_url,
-                caption=rewritten_text[:1024]
-            )
-            logger.info(f"📸 Posted with image to {target_channel_id}")
-        else:
-            await bot.send_message(
-                chat_id=target_channel_id,
-                text=rewritten_text
-            )
-            logger.info(f"📝 Posted text-only to {target_channel_id}")
-    except TelegramAPIError as e:
-        logger.error(f"⚠️ Failed to post to {target_channel_id}: {e}")
-    except Exception as e:
-        logger.error(f"⚠️ Unexpected error: {e}")
+# Store last processed message ID for each source channel
+last_processed = {}
 
-# === STARTUP ===
+async def process_channel(source_id, target_id):
+    """Check for new messages in the source channel and process them."""
+    global last_processed
+    try:
+        # Get the channel entity
+        channel = await user_client.get_entity(source_id)
+        # Get the latest message
+        async for msg in user_client.iter_messages(channel, limit=1):
+            if msg.id == last_processed.get(source_id):
+                return  # No new message
+            # Process the new message
+            logger.info(f"📩 New message in {source_id} (ID: {msg.id})")
+            original_text = msg.text or msg.caption or ""
+            rewritten_text = await rewrite_text(original_text)
+            image_url = None
+            if rewritten_text and len(rewritten_text) > 10:
+                image_url = await generate_image(rewritten_text)
+            if image_url:
+                await bot.send_photo(chat_id=target_id, photo=image_url, caption=rewritten_text[:1024])
+            else:
+                await bot.send_message(chat_id=target_id, text=rewritten_text)
+            last_processed[source_id] = msg.id
+            logger.info(f"✅ Posted to {target_id}")
+            break
+    except Exception as e:
+        logger.error(f"Error processing {source_id}: {e}")
+
+async def poll_channels():
+    """Continuously poll all registered source channels."""
+    while True:
+        clients = database.get_all_clients()
+        for client in clients:
+            source = client["source"]
+            target = client["target"]
+            await process_channel(source, target)
+        await asyncio.sleep(5)  # Check every 5 seconds
+
 async def main():
-    logger.info("Starting Telegram Rewriter Bot...")
+    logger.info("Starting Telegram Rewriter Bot (Polling Mode)...")
     await user_client.start(phone=PHONE)
     logger.info("User client connected!")
-    # Uncomment the line below to add the client mapping locally once, then comment again.
-    # database.add_client(source_channel_id=-1003593544389, target_channel_id=-1004415621706)
-    logger.info("Bot is running. Listening for channel messages...")
-    await user_client.run_until_disconnected()
+
+    # Initialize last_processed for all source channels
+    for client in database.get_all_clients():
+        source = client["source"]
+        try:
+            channel = await user_client.get_entity(source)
+            async for msg in user_client.iter_messages(channel, limit=1):
+                last_processed[source] = msg.id
+                logger.info(f"📌 Last message in {source}: {msg.id}")
+        except Exception as e:
+            logger.error(f"Could not fetch last message from {source}: {e}")
+
+    logger.info("Starting polling loop...")
+    await poll_channels()
 
 if __name__ == "__main__":
     asyncio.run(main())
