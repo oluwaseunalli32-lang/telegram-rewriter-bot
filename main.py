@@ -3,25 +3,19 @@ import asyncio
 import logging
 from pathlib import Path
 from dotenv import load_dotenv
-from telethon import TelegramClient, events
-from aiogram import Bot
-from aiogram.exceptions import TelegramAPIError
 
-import database
-from ai_processor import rewrite_text, generate_image
-
-# === Force load .env from the same folder as this script ===
+# === LOAD ENV FIRST (before importing ai_processor) ===
 env_path = Path(__file__).parent / '.env'
 load_dotenv(dotenv_path=env_path)
 
-# === DEBUG: Print keys (remove after confirming they work) ===
-print("OPENAI_API_KEY:", os.getenv("OPENAI_API_KEY"))
-print("DEEPSEEK_API_KEY:", os.getenv("DEEPSEEK_API_KEY"))
-print("BOT_TOKEN:", os.getenv("BOT_TOKEN"))
-print("API_ID:", os.getenv("API_ID"))
-print("PHONE_NUMBER:", os.getenv("PHONE_NUMBER"))
+# === NOW IMPORT MODULES THAT USE ENV VARIABLES ===
+from telethon import TelegramClient, events
+from aiogram import Bot
+from aiogram.exceptions import TelegramAPIError
+import database
+from ai_processor import rewrite_text, generate_image
 
-# Setup logging
+# === SETUP LOGGING ===
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -31,7 +25,6 @@ API_ID = int(os.getenv("API_ID")) if os.getenv("API_ID") else 0
 API_HASH = os.getenv("API_HASH")
 PHONE = os.getenv("PHONE_NUMBER")
 
-# Sanity check
 if not BOT_TOKEN or not API_ID or not API_HASH or not PHONE:
     logger.error("Missing environment variables! Check .env file.")
     exit(1)
@@ -42,68 +35,50 @@ bot = Bot(token=BOT_TOKEN)
 # Initialize the User Client (for reading source channels without admin)
 user_client = TelegramClient('session_name', API_ID, API_HASH)
 
-# === EVENT HANDLER: Detects new posts in ANY channel the user is in ===
+# === EVENT HANDLER ===
 @user_client.on(events.NewMessage)
 async def handle_new_post(event):
-    # Ignore private chats, only process channel messages
     if not event.is_channel:
         return
-    
     source_channel_id = event.chat_id
-    
-    # Check if this source channel is registered in our database
     target_channel_id = database.get_target_for_source(source_channel_id)
     if not target_channel_id:
-        return  # Not a client's source channel, ignore
-    
+        return
     logger.info(f"New post from source {source_channel_id} -> forwarding to {target_channel_id}")
-    
     try:
-        # Extract text
         original_text = event.message.text or event.message.caption or ""
-        media = event.message.media
-        
-        # Step 1: Rewrite the text using DeepSeek
         rewritten_text = await rewrite_text(original_text)
-        
-        # Step 2: Generate an image using OpenAI DALL-E (if text exists)
         image_url = None
         if rewritten_text and len(rewritten_text) > 10:
             image_url = await generate_image(rewritten_text)
-        
-        # Step 3: Post to target channel using the Bot (must be admin there)
         if image_url:
             await bot.send_photo(
                 chat_id=target_channel_id,
                 photo=image_url,
-                caption=rewritten_text[:1024]  # Telegram caption limit
+                caption=rewritten_text[:1024]
             )
             logger.info(f"Posted with image to {target_channel_id}")
         else:
-            # If no image, just send text
             await bot.send_message(
                 chat_id=target_channel_id,
                 text=rewritten_text
             )
             logger.info(f"Posted text-only to {target_channel_id}")
-            
     except TelegramAPIError as e:
         logger.error(f"Failed to post to {target_channel_id}: {e}")
     except Exception as e:
-        logger.error(f"Unexpected error processing post from {source_channel_id}: {e}")
+        logger.error(f"Unexpected error: {e}")
 
 # === STARTUP ===
 async def main():
     logger.info("Starting Telegram Rewriter Bot...")
-    
-    # Start the user client (this will prompt for phone code on first run)
     await user_client.start(phone=PHONE)
     logger.info("User client connected!")
-    
-    # (Optional) Add a test client entry to the DB – remove this later!
-    # Uncomment the line below to register a test client.
-    # database.add_client(source_channel_id=-1001234567890, target_channel_id=-1009876543210)
-    
+
+    # ✅ REGISTER YOUR CLIENT HERE (Source: CAPPERS FREE, Target: Caps_picks)
+    # This line adds the mapping to the database. Run once, then comment it out.
+    database.add_client(source_channel_id=-1003593544389, target_channel_id=-1004415621706)
+
     logger.info("Bot is running. Listening for channel messages...")
     await user_client.run_until_disconnected()
 
