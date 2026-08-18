@@ -1,28 +1,30 @@
 import os
 from openai import OpenAI
 
-# DeepSeek client (uses OpenAI compatible base URL)
 deepseek_client = OpenAI(
     api_key=os.getenv("DEEPSEEK_API_KEY"),
     base_url="https://api.deepseek.com/v1"
 )
 
-# OpenAI client for DALL-E
 openai_client = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY")
 )
 
 async def rewrite_text(original_text: str) -> str:
-    """Send original text to DeepSeek and get a unique rewrite."""
     if not original_text or len(original_text.strip()) < 5:
         return original_text
-    
+
+    # Replace @usenane with @PrimeAnalysiss (case‑insensitive)
+    # Use regex to replace whole words
+    import re
+    modified_text = re.sub(r'@usenane\b', '@PrimeAnalysiss', original_text, flags=re.IGNORECASE)
+
     try:
         response = deepseek_client.chat.completions.create(
             model="deepseek-chat",
             messages=[
-                {"role": "system", "content": "You are a content rewriter. Rewrite the following text to make it completely unique while preserving all key information, tone, and meaning. Keep the same length. Only output the rewritten text, nothing else."},
-                {"role": "user", "content": original_text}
+                {"role": "system", "content": "You are a content rewriter. Rephrase the provided text to make it unique while keeping all key information, tone, and meaning. Preserve all @mentions exactly as written."},
+                {"role": "user", "content": modified_text}
             ],
             temperature=0.8,
             max_tokens=2000
@@ -30,19 +32,4 @@ async def rewrite_text(original_text: str) -> str:
         return response.choices[0].message.content.strip()
     except Exception as e:
         print(f"DeepSeek error: {e}")
-        return original_text  # Fallback to original
-
-async def generate_image(prompt: str) -> str:
-    """Generate an image using OpenAI DALL-E 3 and return the URL."""
-    try:
-        response = openai_client.images.generate(
-            model="dall-e-3",
-            prompt=f"Create a professional, visually striking cover image for this content: {prompt[:200]}",
-            size="1024x1024",
-            quality="standard",
-            n=1
-        )
-        return response.data[0].url
-    except Exception as e:
-        print(f"OpenAI image error: {e}")
-        return None  # No image if it fails
+        return modified_text  # fallback to modified original
