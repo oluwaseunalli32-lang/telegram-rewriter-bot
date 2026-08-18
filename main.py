@@ -1,20 +1,17 @@
 import os
 import asyncio
 import logging
-import re
 from pathlib import Path
 from dotenv import load_dotenv
-from telethon import TelegramClient
-from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
-from aiogram import Bot
-from aiogram.exceptions import TelegramAPIError
-import database
-from ai_processor import rewrite_text, generate_image
-import io
-from PIL import Image
 
 env_path = Path(__file__).parent / '.env'
 load_dotenv(dotenv_path=env_path)
+
+from telethon import TelegramClient
+from aiogram import Bot
+from aiogram.exceptions import TelegramAPIError
+import database
+from ai_processor import rewrite_text, generate_image  # both functions
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -25,76 +22,49 @@ API_HASH = os.getenv("API_HASH")
 PHONE = os.getenv("PHONE_NUMBER")
 
 if not BOT_TOKEN or not API_ID or not API_HASH or not PHONE:
-    logger.error("Missing environment variables!")
+    logger.error("Missing environment variables! Check .env file.")
     exit(1)
 
 bot = Bot(token=BOT_TOKEN)
 user_client = TelegramClient('session_name', API_ID, API_HASH)
 
-SOURCE_CHANNEL_ID = -1003593544389
-TARGET_CHANNEL_ID = -1004415621706
+# ===== YOUR CHANNEL IDs (already set) =====
+SOURCE_CHANNEL_ID = -1003593544389   # CAPPERS FREE🚦
+TARGET_CHANNEL_ID = -1004415621706   # Caps_picks
 
 last_processed = {}
-
-def extract_first_frame_from_gif(data: bytes) -> bytes:
-    """Extract the first frame of a GIF and return as JPEG bytes."""
-    try:
-        with Image.open(io.BytesIO(data)) as img:
-            if img.is_animated:
-                img.seek(0)  # first frame
-            # Convert to RGB if needed
-            if img.mode in ('RGBA', 'LA', 'P'):
-                img = img.convert('RGB')
-            output = io.BytesIO()
-            img.save(output, format='JPEG', quality=85)
-            return output.getvalue()
-    except Exception as e:
-        logger.error(f"GIF extraction failed: {e}")
-        return None
 
 async def process_channel(source_id, target_id):
     global last_processed
     try:
         channel = await user_client.get_entity(source_id)
         async for msg in user_client.iter_messages(channel, limit=1):
+            # Skip if already processed
             if msg.id == last_processed.get(source_id):
                 return
-            logger.info(f"📩 New message in {source_id} (ID: {msg.id})")
 
+            logger.info(f"📩 New message in {source_id} (ID: {msg.id})")
             original_text = msg.text or msg.caption or ""
+
+            # 1. Rewrite text
             rewritten_text = await rewrite_text(original_text)
 
-            image_bytes = None
-            # Check if message has media
-            if msg.media:
-                # Download the media
-                media_data = await user_client.download_file(msg.media, bytes)
-                if media_data:
-                    # Determine if it's an image or GIF
-                    mime_type = getattr(msg.media, 'mime_type', '')
-                    if 'image/gif' in mime_type:
-                        # GIF – extract first frame
-                        image_bytes = extract_first_frame_from_gif(media_data)
-                    elif 'image' in mime_type:
-                        image_bytes = media_data  # keep as is (will be sent as photo)
-                    # else: ignore other media types
-
-            # If we have an image (from photo or GIF), we can generate a new image using DALL-E
-            # based on the rewritten text, which removes any watermark.
-            # Alternatively, we could send the original image as is, but we want to remove watermark.
-            # We'll generate a new image using DALL-E.
+            # 2. Generate image (if there is text to base prompt on)
             image_url = None
             if rewritten_text and len(rewritten_text) > 10:
                 image_url = await generate_image(rewritten_text)
 
-            # Post to target
+            # 3. Send to target channel
             if image_url:
-                await bot.send_photo(chat_id=target_id, photo=image_url, caption=rewritten_text[:1024])
-                logger.info(f"✅ Posted with generated image to {target_id}")
+                await bot.send_photo(
+                    chat_id=target_id,
+                    photo=image_url,
+                    caption=rewritten_text[:1024]  # Telegram caption limit
+                )
+                logger.info(f"📸 Posted with image to {target_id}")
             else:
-                # fallback: send just text
                 await bot.send_message(chat_id=target_id, text=rewritten_text)
-                logger.info(f"✅ Posted text-only to {target_id}")
+                logger.info(f"📝 Posted text-only to {target_id}")
 
             last_processed[source_id] = msg.id
             break
@@ -112,13 +82,14 @@ async def poll_channels():
             source = client["source"]
             target = client["target"]
             await process_channel(source, target)
-        await asyncio.sleep(5)
+        await asyncio.sleep(5)  # check every 5 seconds
 
 async def main():
-    logger.info("Starting Telegram Rewriter Bot (Polling Mode)...")
+    logger.info("Starting Telegram Rewriter Bot (with Image Generation)...")
     await user_client.start(phone=PHONE)
     logger.info("User client connected!")
 
+    # Auto‑register your client if not already in DB
     existing = database.get_target_for_source(SOURCE_CHANNEL_ID)
     if existing is None:
         logger.info(f"📝 Adding client: {SOURCE_CHANNEL_ID} → {TARGET_CHANNEL_ID}")
@@ -126,6 +97,7 @@ async def main():
     else:
         logger.info(f"✅ Client already registered: {SOURCE_CHANNEL_ID} → {existing}")
 
+    # Initialize last_processed for all source channels
     for client in database.get_all_clients():
         source = client["source"]
         try:
