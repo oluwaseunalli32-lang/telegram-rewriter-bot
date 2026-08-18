@@ -28,20 +28,19 @@ if not BOT_TOKEN or not API_ID or not API_HASH or not PHONE:
 bot = Bot(token=BOT_TOKEN)
 user_client = TelegramClient('session_name', API_ID, API_HASH)
 
-# Store last processed message ID for each source channel
+# === CONFIGURATION – YOUR CHANNEL IDs ===
+SOURCE_CHANNEL_ID = -1003593544389   # CAPPERS FREE🚦
+TARGET_CHANNEL_ID = -1004415621706   # Caps_picks
+
 last_processed = {}
 
 async def process_channel(source_id, target_id):
-    """Check for new messages in the source channel and process them."""
     global last_processed
     try:
-        # Get the channel entity
         channel = await user_client.get_entity(source_id)
-        # Get the latest message
         async for msg in user_client.iter_messages(channel, limit=1):
             if msg.id == last_processed.get(source_id):
-                return  # No new message
-            # Process the new message
+                return
             logger.info(f"📩 New message in {source_id} (ID: {msg.id})")
             original_text = msg.text or msg.caption or ""
             rewritten_text = await rewrite_text(original_text)
@@ -59,19 +58,31 @@ async def process_channel(source_id, target_id):
         logger.error(f"Error processing {source_id}: {e}")
 
 async def poll_channels():
-    """Continuously poll all registered source channels."""
     while True:
+        # Get clients from DB
         clients = database.get_all_clients()
+        if not clients:
+            logger.warning("⚠️ No clients in database – waiting...")
+            await asyncio.sleep(10)
+            continue
         for client in clients:
             source = client["source"]
             target = client["target"]
             await process_channel(source, target)
-        await asyncio.sleep(5)  # Check every 5 seconds
+        await asyncio.sleep(5)
 
 async def main():
     logger.info("Starting Telegram Rewriter Bot (Polling Mode)...")
     await user_client.start(phone=PHONE)
     logger.info("User client connected!")
+
+    # === AUTO‑REGISTER your client if not already in DB ===
+    existing = database.get_target_for_source(SOURCE_CHANNEL_ID)
+    if existing is None:
+        logger.info(f"📝 Adding client: {SOURCE_CHANNEL_ID} → {TARGET_CHANNEL_ID}")
+        database.add_client(SOURCE_CHANNEL_ID, TARGET_CHANNEL_ID)
+    else:
+        logger.info(f"✅ Client already registered: {SOURCE_CHANNEL_ID} → {existing}")
 
     # Initialize last_processed for all source channels
     for client in database.get_all_clients():
