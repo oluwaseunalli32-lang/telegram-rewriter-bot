@@ -3,6 +3,7 @@ import asyncio
 import logging
 from pathlib import Path
 from dotenv import load_dotenv
+from io import BytesIO
 
 env_path = Path(__file__).parent / '.env'
 load_dotenv(dotenv_path=env_path)
@@ -34,25 +35,29 @@ TARGET_CHANNEL_ID = -1004415621706
 last_processed = {}
 
 async def process_channel(source_id, target_id):
-    global last_processed
+    """
+    Fetch the latest message from the source channel.
+    If it's new, process it (rewrite + regenerate image) and post to target.
+    """
     try:
         channel = await user_client.get_entity(source_id)
         async for msg in user_client.iter_messages(channel, limit=1):
-            # Skip if already processed
+            # If we've already processed this message ID, skip
             if msg.id == last_processed.get(source_id):
                 return
 
-            # Mark as processed immediately to avoid duplicate processing
+            # Mark as processed immediately (prevents infinite loops)
             last_processed[source_id] = msg.id
 
             logger.info(f"📩 New message in {source_id} (ID: {msg.id})")
+
+            # 1. Rewrite text
             original_text = msg.text or msg.caption or ""
             rewritten_text = await rewrite_text(original_text)
 
-            # --- Check for media (photo or GIF) ---
+            # 2. Check for media (photo or GIF)
             image_bytes = None
             if msg.photo:
-                # Download photo as bytes
                 try:
                     image_bytes = await user_client.download_media(msg.photo, bytes)
                     if image_bytes:
@@ -63,7 +68,6 @@ async def process_channel(source_id, target_id):
                     logger.error(f"Error downloading photo: {e}")
 
             elif msg.document and msg.document.mime_type and 'gif' in msg.document.mime_type:
-                # Download GIF as bytes
                 try:
                     image_bytes = await user_client.download_media(msg.document, bytes)
                     if image_bytes:
@@ -73,7 +77,7 @@ async def process_channel(source_id, target_id):
                 except Exception as e:
                     logger.error(f"Error downloading GIF: {e}")
 
-            # If we have image bytes, regenerate
+            # 3. If we have image bytes, try to regenerate
             if image_bytes:
                 new_image_url = await regenerate_image_from_bytes(image_bytes)
                 if new_image_url:
@@ -84,10 +88,7 @@ async def process_channel(source_id, target_id):
                     )
                     logger.info(f"📸 Posted regenerated image to {target_id}")
                 else:
-                    # Fallback: send the original image (if we have bytes, we can send it)
-                    # But we don't have a URL; we can upload the bytes to Telegram using bot.send_photo with bytes
-                    # However, send_photo accepts file-like objects, so we can use BytesIO
-                    from io import BytesIO
+                    # Fallback: send original image (as bytes)
                     await bot.send_photo(
                         chat_id=target_id,
                         photo=BytesIO(image_bytes),
@@ -99,6 +100,7 @@ async def process_channel(source_id, target_id):
                 await bot.send_message(chat_id=target_id, text=rewritten_text)
                 logger.info(f"📝 Posted text-only to {target_id}")
 
+            # Exit the loop after processing the latest message
             break
     except Exception as e:
         logger.error(f"Error processing {source_id}: {e}")
@@ -121,6 +123,7 @@ async def main():
     await user_client.start(phone=PHONE)
     logger.info("User client connected!")
 
+    # Auto-register the client if not present
     existing = database.get_target_for_source(SOURCE_CHANNEL_ID)
     if existing is None:
         logger.info(f"📝 Adding client: {SOURCE_CHANNEL_ID} → {TARGET_CHANNEL_ID}")
@@ -128,6 +131,7 @@ async def main():
     else:
         logger.info(f"✅ Client already registered: {SOURCE_CHANNEL_ID} → {existing}")
 
+    # Initialize last_processed for all source channels
     for client in database.get_all_clients():
         source = client["source"]
         try:
