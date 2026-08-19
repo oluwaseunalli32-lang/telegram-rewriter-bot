@@ -8,7 +8,7 @@ from io import BytesIO
 env_path = Path(__file__).parent / '.env'
 load_dotenv(dotenv_path=env_path)
 
-from telethon import TelegramClient
+from telethon import TelegramClient, errors
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 import database
@@ -32,13 +32,35 @@ user_client = TelegramClient('session_name', API_ID, API_HASH)
 SOURCE_CHANNEL_ID = -1003593544389
 TARGET_CHANNEL_ID = -1004415621706
 
-# Toggle: generate image for text-only posts (set to False to save costs)
 ENABLE_IMAGE_FOR_TEXT = os.getenv("ENABLE_IMAGE_FOR_TEXT", "true").lower() == "true"
 
 last_processed = {}
 
+# === NEW: Connection safety net ===
+async def ensure_connection():
+    """Check if the client is connected. If not, reconnect."""
+    if not user_client.is_connected():
+        logger.warning("⚠️ Client disconnected! Attempting to reconnect...")
+        try:
+            await user_client.connect()
+            if not user_client.is_connected():
+                logger.info("Reconnecting via .start()...")
+                await user_client.start(phone=PHONE)
+            logger.info("✅ Reconnected successfully!")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Reconnection failed: {e}")
+            return False
+    return True
+
 async def process_channel(source_id, target_id):
     global last_processed
+    
+    # Step 0: Ensure we are connected BEFORE doing anything
+    if not await ensure_connection():
+        logger.error("❌ Cannot process: Client is disconnected and reconnection failed.")
+        return
+
     try:
         channel = await user_client.get_entity(source_id)
         async for msg in user_client.iter_messages(channel, limit=1):
@@ -107,11 +129,20 @@ async def process_channel(source_id, target_id):
                 logger.info(f"📝 Posted text-only to {target_id}")
 
             break
+    except errors.rpcerrorlist.AuthKeyError as e:
+        logger.error(f"Authentication error: {e}. Restarting client...")
+        await user_client.start(phone=PHONE)
     except Exception as e:
         logger.error(f"Error processing {source_id}: {e}")
 
 async def poll_channels():
     while True:
+        # Ensure connection at the start of every loop iteration
+        if not await ensure_connection():
+            logger.warning("⚠️ Offline, waiting 10 seconds to retry...")
+            await asyncio.sleep(10)
+            continue
+
         clients = database.get_all_clients()
         if not clients:
             logger.warning("⚠️ No clients in database – waiting...")
@@ -124,8 +155,15 @@ async def poll_channels():
         await asyncio.sleep(5)
 
 async def main():
-    logger.info("Starting Telegram Rewriter Bot (Hybrid Mode)...")
+    logger.info("Starting Telegram Rewriter Bot (Hybrid Mode with Auto-Reconnect)...")
+    
+    # Initial connect
     await user_client.start(phone=PHONE)
+    if not user_client.is_connected():
+        await user_client.connect()
+        if not user_client.is_connected():
+            logger.error("❌ Failed to connect on startup!")
+            return
     logger.info("User client connected!")
 
     existing = database.get_target_for_source(SOURCE_CHANNEL_ID)
