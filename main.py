@@ -90,28 +90,24 @@ async def process_channel(source_id, target_id):
 
     try:
         channel = await user_client.get_entity(source_id)
-        # Get the last processed message ID, default to 0 if none
         last_id = last_processed.get(source_id, 0)
         
-        # Fetch all messages newer than last_id
+        # Fetch all messages newer than last_id, in chronological order
         new_messages = []
         async for msg in user_client.iter_messages(channel, min_id=last_id, reverse=True):
             new_messages.append(msg)
         
         if not new_messages:
-            return  # No new messages
+            return
 
-        # Update last_processed to the newest message ID
         last_processed[source_id] = new_messages[-1].id
 
         for msg in new_messages:
             logger.info(f"📩 Processing message ID: {msg.id}")
 
-            # --- Rewrite text ---
             original_text = msg.text or msg.caption or ""
             rewritten_text = await rewrite_text(original_text)
 
-            # --- Check for media ---
             media_list = []
             if msg.photo:
                 media_list.append(msg.photo)
@@ -121,17 +117,16 @@ async def process_channel(source_id, target_id):
                 media_list.append(msg.media)
 
             if media_list:
-                logger.info(f"📸 Found {len(media_list)} media items in this message")
+                logger.info(f"📸 Found {len(media_list)} media items")
                 for idx, media in enumerate(media_list):
-                    # Only add caption to the first image (to avoid duplicates)
                     caption = rewritten_text[:1024] if idx == 0 else None
                     await process_single_media(media, caption, target_id)
-                # If there are multiple images, we might want to send the text as a separate message for the rest
-                # But for now, we only attach caption to the first image
+                    # Small delay between images to avoid rate limits
+                    if idx < len(media_list) - 1:
+                        await asyncio.sleep(2)
             else:
-                # No media – generate image from text if enabled
                 if ENABLE_IMAGE_FOR_TEXT and rewritten_text and len(rewritten_text) > 10:
-                    logger.info("🖼️ No media, generating image from rewritten text...")
+                    logger.info("🖼️ Generating image from text...")
                     image_url = await generate_image_from_description(rewritten_text)
                     if image_url:
                         await bot.send_photo(
@@ -142,10 +137,13 @@ async def process_channel(source_id, target_id):
                         logger.info("📸 Posted generated image from text")
                     else:
                         await bot.send_message(chat_id=target_id, text=rewritten_text)
-                        logger.info("📝 Posted text-only (image generation failed)")
+                        logger.info("📝 Posted text-only (image gen failed)")
                 else:
                     await bot.send_message(chat_id=target_id, text=rewritten_text)
                     logger.info("📝 Posted text-only")
+
+            # Add a delay between processing messages to avoid rate limits
+            await asyncio.sleep(3)
 
     except errors.rpcerrorlist.AuthKeyError as e:
         logger.error(f"Authentication error: {e}. Restarting...")
@@ -168,7 +166,7 @@ async def poll_channels():
         await asyncio.sleep(5)
 
 async def main():
-    logger.info("Starting Telegram Rewriter Bot (Multi-Message + Watermark Removal)...")
+    logger.info("Starting Telegram Rewriter Bot (Multi‑Message + Retry + Watermark Removal)...")
     
     await user_client.start(phone=PHONE)
     if not user_client.is_connected():
@@ -185,7 +183,6 @@ async def main():
     else:
         logger.info(f"✅ Client already registered: {SOURCE_CHANNEL_ID} → {existing}")
 
-    # Initialize last_processed with the latest message ID for each source
     for client in database.get_all_clients():
         source = client["source"]
         try:
