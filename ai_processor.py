@@ -16,36 +16,28 @@ openai_client = OpenAI(
 )
 
 # --- Config ---
-NEW_MENTION = os.getenv("NEW_MENTION", "")  # e.g., "@MyNewChannel" – if empty, we just remove old mentions
+NEW_MENTION = os.getenv("NEW_MENTION", "")
 OLD_MENTION = "@cappersfree"
 
 def clean_mentions(text: str) -> str:
-    """Remove or replace the old mention."""
     if not text:
         return text
     if NEW_MENTION:
-        # Replace old mention with new one (case-insensitive)
         text = re.sub(OLD_MENTION, NEW_MENTION, text, flags=re.IGNORECASE)
     else:
-        # Remove all @mentions (including the old one)
         text = re.sub(r'@\w+', '', text)
     return text
 
 def clean_text(text: str) -> str:
-    """Remove extra formatting and mentions."""
     if not text:
         return text
-    # Remove @mentions
     text = clean_mentions(text)
-    # Remove **bold** and __italic__ markers
     text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
     text = re.sub(r'__([^_]+)__', r'\1', text)
-    # Remove extra spaces
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
 async def rewrite_text(original_text: str) -> str:
-    """Rewrite text with DeepSeek, then clean mentions/formatting."""
     cleaned = clean_text(original_text)
     if not cleaned or len(cleaned) < 5:
         return original_text
@@ -60,7 +52,6 @@ async def rewrite_text(original_text: str) -> str:
             max_tokens=2000
         )
         rewritten = response.choices[0].message.content.strip()
-        # Final cleaning
         rewritten = clean_mentions(rewritten)
         rewritten = re.sub(r'\*\*([^*]+)\*\*', r'\1', rewritten)
         return rewritten
@@ -68,22 +59,16 @@ async def rewrite_text(original_text: str) -> str:
         print(f"DeepSeek error: {e}")
         return original_text
 
-async def describe_image_for_regeneration(image_url: str) -> str:
+async def describe_image_bytes(image_bytes: bytes) -> str:
     """
-    Use GPT-4 Vision to get a clean description of the image,
-    ignoring any watermarks, logos, or text.
+    Use GPT-4 Vision to describe an image from raw bytes.
+    Returns a description string, or None on failure.
     """
     try:
-        # Download the image (or GIF) and extract first frame if needed
-        response = requests.get(image_url, timeout=30)
-        if response.status_code != 200:
-            raise Exception("Failed to download image")
-
-        img = Image.open(BytesIO(response.content))
-        # If it's a GIF, get the first frame
+        # Convert to base64
+        img = Image.open(BytesIO(image_bytes))
         if getattr(img, 'is_animated', False):
             img.seek(0)  # first frame
-        # Convert to RGB and encode as base64 JPEG
         if img.mode != 'RGB':
             img = img.convert('RGB')
         buffered = BytesIO()
@@ -93,7 +78,7 @@ async def describe_image_for_regeneration(image_url: str) -> str:
 
         # Call GPT-4 Vision
         vision_response = openai_client.chat.completions.create(
-            model="gpt-4-turbo",  # or "gpt-4-vision-preview" if still available
+            model="gpt-4-turbo",
             messages=[
                 {
                     "role": "user",
@@ -105,19 +90,15 @@ async def describe_image_for_regeneration(image_url: str) -> str:
             ],
             max_tokens=300
         )
-        description = vision_response.choices[0].message.content.strip()
-        print(f"Vision description: {description[:100]}...")
-        return description
+        return vision_response.choices[0].message.content.strip()
     except Exception as e:
         print(f"Vision error: {e}")
         return None
 
 async def generate_image_from_description(prompt: str) -> str:
-    """Generate a new image using DALL-E 3 from the description."""
     if not prompt or len(prompt) < 10:
         return None
     try:
-        # Shorten prompt if needed
         safe_prompt = f"A professional illustration representing: {prompt[:300]}"
         response = openai_client.images.generate(
             model="dall-e-3",
@@ -131,10 +112,26 @@ async def generate_image_from_description(prompt: str) -> str:
         print(f"DALL-E error: {e}")
         return None
 
-async def regenerate_image_from_url(image_url: str) -> str:
-    """Full pipeline: describe image -> generate new image."""
-    description = await describe_image_for_regeneration(image_url)
+async def regenerate_image_from_bytes(image_bytes: bytes) -> str:
+    """Full pipeline: describe image bytes -> generate new image."""
+    description = await describe_image_bytes(image_bytes)
     if not description:
         return None
-    new_url = await generate_image_from_description(description)
-    return new_url
+    return await generate_image_from_description(description)
+
+# Keep the old URL-based function for backward compatibility if needed
+async def describe_image_url(image_url: str) -> str:
+    try:
+        response = requests.get(image_url, timeout=30)
+        if response.status_code != 200:
+            raise Exception("Failed to download image")
+        return await describe_image_bytes(response.content)
+    except Exception as e:
+        print(f"Download error: {e}")
+        return None
+
+async def regenerate_image_from_url(image_url: str) -> str:
+    description = await describe_image_url(image_url)
+    if not description:
+        return None
+    return await generate_image_from_description(description)
