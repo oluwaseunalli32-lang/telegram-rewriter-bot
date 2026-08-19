@@ -12,7 +12,7 @@ from telethon import TelegramClient
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 import database
-from ai_processor import rewrite_text, regenerate_image_from_bytes
+from ai_processor import rewrite_text, regenerate_image_from_bytes, generate_image_from_description
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -29,9 +29,11 @@ if not BOT_TOKEN or not API_ID or not API_HASH or not PHONE:
 bot = Bot(token=BOT_TOKEN)
 user_client = TelegramClient('session_name', API_ID, API_HASH)
 
-# ===== YOUR CHANNEL IDs (already set) =====
-SOURCE_CHANNEL_ID = -1003593544389   # CAPPERS FREE🚦
-TARGET_CHANNEL_ID = -1004415621706   # Caps_picks
+SOURCE_CHANNEL_ID = -1003593544389
+TARGET_CHANNEL_ID = -1004415621706
+
+# Toggle: generate image for text-only posts (set to False to save costs)
+ENABLE_IMAGE_FOR_TEXT = os.getenv("ENABLE_IMAGE_FOR_TEXT", "true").lower() == "true"
 
 last_processed = {}
 
@@ -40,85 +42,67 @@ async def process_channel(source_id, target_id):
     try:
         channel = await user_client.get_entity(source_id)
         async for msg in user_client.iter_messages(channel, limit=1):
-            # Skip if already processed
             if msg.id == last_processed.get(source_id):
                 return
 
-            # Mark as processed immediately
             last_processed[source_id] = msg.id
             logger.info(f"📩 New message in {source_id} (ID: {msg.id})")
 
-            # --- Extract text ---
+            # --- Rewrite text ---
             original_text = msg.text or msg.caption or ""
             rewritten_text = await rewrite_text(original_text)
 
-            # --- Detect media (photo, GIF, video) ---
+            # --- Check for media ---
             image_bytes = None
             media = msg.media
+            final_image_url = None
 
             if media:
-                logger.info(f"🔍 Media type: {type(media)}")
-
-                # Check for photo (MessageMediaPhoto)
-                if hasattr(media, 'photo'):
-                    try:
-                        image_bytes = await user_client.download_media(media, bytes)
-                        if image_bytes:
-                            logger.info("✅ Downloaded photo bytes")
-                        else:
-                            logger.warning("Could not download photo")
-                    except Exception as e:
-                        logger.error(f"Error downloading photo: {e}")
-
-                # Check for document (could be GIF, image, video)
-                elif hasattr(media, 'document') and media.document:
-                    mime_type = media.document.mime_type
-                    if mime_type:
-                        if 'image' in mime_type:
-                            try:
-                                image_bytes = await user_client.download_media(media, bytes)
-                                if image_bytes:
-                                    logger.info(f"✅ Downloaded image ({mime_type}) bytes")
-                                else:
-                                    logger.warning(f"Could not download image ({mime_type})")
-                            except Exception as e:
-                                logger.error(f"Error downloading image: {e}")
-                        elif mime_type == 'image/gif':
-                            try:
-                                image_bytes = await user_client.download_media(media, bytes)
-                                if image_bytes:
-                                    logger.info("✅ Downloaded GIF bytes")
-                                else:
-                                    logger.warning("Could not download GIF")
-                            except Exception as e:
-                                logger.error(f"Error downloading GIF: {e}")
-                        elif 'video' in mime_type:
-                            logger.info("🎥 Video detected – skipping regeneration (video not supported)")
-                        else:
-                            logger.info(f"📄 Unsupported document type: {mime_type}")
+                logger.info(f"🔍 Media detected: {type(media)}")
+                try:
+                    image_bytes = await user_client.download_media(media, bytes)
+                    if image_bytes:
+                        logger.info("✅ Downloaded media bytes")
                     else:
-                        logger.warning("Document has no mime_type")
+                        logger.warning("Could not download media")
+                except Exception as e:
+                    logger.error(f"Error downloading media: {e}")
 
-            # --- Process image if we have bytes ---
+            # --- Case 1: We have media (image/GIF) -> Regenerate using Vision + DALL-E ---
             if image_bytes:
+                logger.info("🔄 Regenerating image via Vision + DALL-E (removing watermarks)...")
                 new_image_url = await regenerate_image_from_bytes(image_bytes)
                 if new_image_url:
-                    await bot.send_photo(
-                        chat_id=target_id,
-                        photo=new_image_url,
-                        caption=rewritten_text[:1024]
-                    )
-                    logger.info(f"📸 Posted regenerated image to {target_id}")
+                    final_image_url = new_image_url
+                    logger.info("✅ Successfully regenerated image")
                 else:
-                    # Fallback: send original image
+                    logger.warning("Regeneration failed, falling back to original media")
                     await bot.send_photo(
                         chat_id=target_id,
                         photo=BytesIO(image_bytes),
                         caption=rewritten_text[:1024]
                     )
-                    logger.info(f"📸 Posted original image (regeneration failed) to {target_id}")
+                    logger.info(f"📸 Posted original media (regeneration failed) to {target_id}")
+                    return
+
+            # --- Case 2: No media (text-only) -> Optionally generate image from text ---
+            elif ENABLE_IMAGE_FOR_TEXT and rewritten_text and len(rewritten_text) > 10:
+                logger.info("🖼️ No media, generating image from rewritten text (DALL-E)...")
+                final_image_url = await generate_image_from_description(rewritten_text)
+                if final_image_url:
+                    logger.info("✅ Generated image from text")
+                else:
+                    logger.warning("Text-to-image generation failed, sending text only")
+
+            # --- Post the result ---
+            if final_image_url:
+                await bot.send_photo(
+                    chat_id=target_id,
+                    photo=final_image_url,
+                    caption=rewritten_text[:1024]
+                )
+                logger.info(f"📸 Posted with new image to {target_id}")
             else:
-                # Text-only
                 await bot.send_message(chat_id=target_id, text=rewritten_text)
                 logger.info(f"📝 Posted text-only to {target_id}")
 
@@ -140,11 +124,10 @@ async def poll_channels():
         await asyncio.sleep(5)
 
 async def main():
-    logger.info("Starting Telegram Rewriter Bot (Vision + Regeneration Mode)...")
+    logger.info("Starting Telegram Rewriter Bot (Hybrid Mode)...")
     await user_client.start(phone=PHONE)
     logger.info("User client connected!")
 
-    # Auto-register your client if not already in DB
     existing = database.get_target_for_source(SOURCE_CHANNEL_ID)
     if existing is None:
         logger.info(f"📝 Adding client: {SOURCE_CHANNEL_ID} → {TARGET_CHANNEL_ID}")
@@ -152,7 +135,6 @@ async def main():
     else:
         logger.info(f"✅ Client already registered: {SOURCE_CHANNEL_ID} → {existing}")
 
-    # Initialize last_processed for all source channels
     for client in database.get_all_clients():
         source = client["source"]
         try:
