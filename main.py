@@ -11,7 +11,7 @@ from telethon import TelegramClient
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 import database
-from ai_processor import rewrite_text, regenerate_image_from_url
+from ai_processor import rewrite_text, regenerate_image_from_bytes
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -38,50 +38,44 @@ async def process_channel(source_id, target_id):
     try:
         channel = await user_client.get_entity(source_id)
         async for msg in user_client.iter_messages(channel, limit=1):
+            # Skip if already processed
             if msg.id == last_processed.get(source_id):
                 return
-            logger.info(f"📩 New message in {source_id} (ID: {msg.id})")
 
-            # --- Extract text ---
+            # Mark as processed immediately to avoid duplicate processing
+            last_processed[source_id] = msg.id
+
+            logger.info(f"📩 New message in {source_id} (ID: {msg.id})")
             original_text = msg.text or msg.caption or ""
             rewritten_text = await rewrite_text(original_text)
 
             # --- Check for media (photo or GIF) ---
-            image_url = None
+            image_bytes = None
             if msg.photo:
-                # Get the largest photo size
-                photo = msg.photo
-                file = await user_client.download_media(photo, bytes)
-                if file:
-                    # We need a URL; we'll use the file ID to get a direct link
-                    # Telethon doesn't provide a direct URL; we can upload to a hosting or use the file_id with bot API
-                    # Simplest: we use the bot API to get the file path and then construct a URL
-                    # But easier: use the bot to get the file and send it
-                    # However, we can just use the built-in `get_file_url` trick:
-                    # For simplicity, we'll use the message's media group ID or download and re-upload? 
-                    # Actually we can use the bot's getFile method to get a URL.
-                    # But to avoid complexity, we can skip Vision for now and just send the image as is.
-                    # For Option 3, we need an accessible URL. We'll use a free image host or use the bot's file URL.
-                    # Let's implement a helper to get a public URL for the photo via the bot API.
-                    file_info = await bot.get_file(msg.photo.file_id)
-                    file_path = file_info.file_path
-                    image_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
-                else:
-                    logger.warning("Could not download photo")
-            elif msg.document and msg.document.mime_type and 'gif' in msg.document.mime_type:
-                # It's a GIF
-                file = await user_client.download_media(msg.document, bytes)
-                if file:
-                    # We need a URL; we'll use the file ID similarly
-                    file_info = await bot.get_file(msg.document.file_id)
-                    file_path = file_info.file_path
-                    image_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
-                else:
-                    logger.warning("Could not download GIF")
+                # Download photo as bytes
+                try:
+                    image_bytes = await user_client.download_media(msg.photo, bytes)
+                    if image_bytes:
+                        logger.info("✅ Downloaded photo bytes")
+                    else:
+                        logger.warning("Could not download photo")
+                except Exception as e:
+                    logger.error(f"Error downloading photo: {e}")
 
-            # If we have an image URL, regenerate it
-            if image_url:
-                new_image_url = await regenerate_image_from_url(image_url)
+            elif msg.document and msg.document.mime_type and 'gif' in msg.document.mime_type:
+                # Download GIF as bytes
+                try:
+                    image_bytes = await user_client.download_media(msg.document, bytes)
+                    if image_bytes:
+                        logger.info("✅ Downloaded GIF bytes")
+                    else:
+                        logger.warning("Could not download GIF")
+                except Exception as e:
+                    logger.error(f"Error downloading GIF: {e}")
+
+            # If we have image bytes, regenerate
+            if image_bytes:
+                new_image_url = await regenerate_image_from_bytes(image_bytes)
                 if new_image_url:
                     await bot.send_photo(
                         chat_id=target_id,
@@ -90,10 +84,13 @@ async def process_channel(source_id, target_id):
                     )
                     logger.info(f"📸 Posted regenerated image to {target_id}")
                 else:
-                    # Fallback: send original image with rewritten text
+                    # Fallback: send the original image (if we have bytes, we can send it)
+                    # But we don't have a URL; we can upload the bytes to Telegram using bot.send_photo with bytes
+                    # However, send_photo accepts file-like objects, so we can use BytesIO
+                    from io import BytesIO
                     await bot.send_photo(
                         chat_id=target_id,
-                        photo=image_url,
+                        photo=BytesIO(image_bytes),
                         caption=rewritten_text[:1024]
                     )
                     logger.info(f"📸 Posted original image (regeneration failed) to {target_id}")
@@ -102,7 +99,6 @@ async def process_channel(source_id, target_id):
                 await bot.send_message(chat_id=target_id, text=rewritten_text)
                 logger.info(f"📝 Posted text-only to {target_id}")
 
-            last_processed[source_id] = msg.id
             break
     except Exception as e:
         logger.error(f"Error processing {source_id}: {e}")
