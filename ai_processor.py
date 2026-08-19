@@ -60,12 +60,8 @@ async def rewrite_text(original_text: str) -> str:
         return original_text
 
 async def describe_image_bytes(image_bytes: bytes) -> str:
-    """
-    Use GPT-4 Vision to describe an image from raw bytes.
-    Returns a description string, or None on failure.
-    """
+    """Use GPT-4 Vision to describe image from raw bytes."""
     try:
-        # Convert to base64
         img = Image.open(BytesIO(image_bytes))
         if getattr(img, 'is_animated', False):
             img.seek(0)  # first frame
@@ -76,9 +72,8 @@ async def describe_image_bytes(image_bytes: bytes) -> str:
         img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
         data_url = f"data:image/jpeg;base64,{img_base64}"
 
-        # Call GPT-4 Vision
         vision_response = openai_client.chat.completions.create(
-            model="gpt-4-turbo",
+            model="gpt-4-turbo",  # Use "gpt-4o" if this fails
             messages=[
                 {
                     "role": "user",
@@ -113,25 +108,7 @@ async def generate_image_from_description(prompt: str) -> str:
         return None
 
 async def regenerate_image_from_bytes(image_bytes: bytes) -> str:
-    """Full pipeline: describe image bytes -> generate new image."""
     description = await describe_image_bytes(image_bytes)
-    if not description:
-        return None
-    return await generate_image_from_description(description)
-
-# Keep the old URL-based function for backward compatibility if needed
-async def describe_image_url(image_url: str) -> str:
-    try:
-        response = requests.get(image_url, timeout=30)
-        if response.status_code != 200:
-            raise Exception("Failed to download image")
-        return await describe_image_bytes(response.content)
-    except Exception as e:
-        print(f"Download error: {e}")
-        return None
-
-async def regenerate_image_from_url(image_url: str) -> str:
-    description = await describe_image_url(image_url)
     if not description:
         return None
     return await generate_image_from_description(description)
