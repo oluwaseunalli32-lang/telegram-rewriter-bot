@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 from dotenv import load_dotenv
 from io import BytesIO
-from aiogram.types import BufferedInputFile  # ADD THIS IMPORT
+from aiogram.types import BufferedInputFile
 
 env_path = Path(__file__).parent / '.env'
 load_dotenv(dotenv_path=env_path)
@@ -38,13 +38,11 @@ ENABLE_IMAGE_FOR_TEXT = os.getenv("ENABLE_IMAGE_FOR_TEXT", "true").lower() == "t
 last_processed = {}
 
 async def ensure_connection():
-    """Check if the client is connected. If not, reconnect."""
     if not user_client.is_connected():
         logger.warning("⚠️ Client disconnected! Attempting to reconnect...")
         try:
             await user_client.connect()
             if not user_client.is_connected():
-                logger.info("Reconnecting via .start()...")
                 await user_client.start(phone=PHONE)
             logger.info("✅ Reconnected successfully!")
             return True
@@ -53,11 +51,44 @@ async def ensure_connection():
             return False
     return True
 
+async def process_single_media(media, rewritten_text, target_id):
+    """Process a single media item (image or GIF) – regenerate or fallback."""
+    try:
+        image_bytes = await user_client.download_media(media, bytes)
+        if not image_bytes:
+            logger.warning("Could not download media")
+            return None
+
+        logger.info("🔄 Regenerating image via Vision + DALL-E (removing watermarks)...")
+        new_image_url = await regenerate_image_from_bytes(image_bytes)
+        
+        if new_image_url:
+            await bot.send_photo(
+                chat_id=target_id,
+                photo=new_image_url,
+                caption=rewritten_text[:1024]
+            )
+            logger.info("📸 Posted regenerated image")
+            return True
+        else:
+            logger.warning("Regeneration failed, falling back to original media")
+            input_file = BufferedInputFile(file=image_bytes, filename="original_image.jpg")
+            await bot.send_photo(
+                chat_id=target_id,
+                photo=input_file,
+                caption=rewritten_text[:1024]
+            )
+            logger.info("📸 Posted original media (regeneration failed)")
+            return True
+    except Exception as e:
+        logger.error(f"Error processing media: {e}")
+        return False
+
 async def process_channel(source_id, target_id):
     global last_processed
     
     if not await ensure_connection():
-        logger.error("❌ Cannot process: Client is disconnected and reconnection failed.")
+        logger.error("❌ Cannot process: Client is disconnected.")
         return
 
     try:
@@ -69,70 +100,48 @@ async def process_channel(source_id, target_id):
             last_processed[source_id] = msg.id
             logger.info(f"📩 New message in {source_id} (ID: {msg.id})")
 
+            # --- Rewrite text ---
             original_text = msg.text or msg.caption or ""
             rewritten_text = await rewrite_text(original_text)
 
-            image_bytes = None
-            media = msg.media
-            final_image_url = None
+            # --- Check for media ---
+            media_list = []
+            if msg.photo:
+                media_list.append(msg.photo)
+            elif msg.document and msg.document.mime_type and ('image' in msg.document.mime_type or 'gif' in msg.document.mime_type):
+                media_list.append(msg.document)
+            elif msg.media and hasattr(msg.media, 'photo'):
+                media_list.append(msg.media)
 
-            if media:
-                logger.info(f"🔍 Media detected: {type(media)}")
-                try:
-                    image_bytes = await user_client.download_media(media, bytes)
-                    if image_bytes:
-                        logger.info("✅ Downloaded media bytes")
-                    else:
-                        logger.warning("Could not download media")
-                except Exception as e:
-                    logger.error(f"Error downloading media: {e}")
+            # --- If we have media, process each one ---
+            if media_list:
+                logger.info(f"📸 Found {len(media_list)} media items in this message")
+                for idx, media in enumerate(media_list):
+                    logger.info(f"Processing media {idx+1}/{len(media_list)}")
+                    caption = rewritten_text[:1024] if idx == 0 else None  # Only add caption to first image
+                    await process_single_media(media, rewritten_text if idx == 0 else "", target_id)
+                return
 
-            # --- Case 1: We have media -> Regenerate using Vision + DALL-E ---
-            if image_bytes:
-                logger.info("🔄 Regenerating image via Vision + DALL-E (removing watermarks)...")
-                new_image_url = await regenerate_image_from_bytes(image_bytes)
-                if new_image_url:
-                    final_image_url = new_image_url
-                    logger.info("✅ Successfully regenerated image")
-                else:
-                    # FIXED FALLBACK – uses BufferedInputFile
-                    logger.warning("Regeneration failed, falling back to original media")
-                    input_file = BufferedInputFile(
-                        file=image_bytes,
-                        filename="original_image.jpg"
-                    )
+            # --- No media -> generate image from text if enabled ---
+            if ENABLE_IMAGE_FOR_TEXT and rewritten_text and len(rewritten_text) > 10:
+                logger.info("🖼️ No media, generating image from rewritten text...")
+                image_url = await generate_image_from_description(rewritten_text)
+                if image_url:
                     await bot.send_photo(
                         chat_id=target_id,
-                        photo=input_file,
+                        photo=image_url,
                         caption=rewritten_text[:1024]
                     )
-                    logger.info(f"📸 Posted original media (regeneration failed) to {target_id}")
+                    logger.info("📸 Posted generated image from text")
                     return
 
-            # --- Case 2: No media -> Optionally generate image from text ---
-            elif ENABLE_IMAGE_FOR_TEXT and rewritten_text and len(rewritten_text) > 10:
-                logger.info("🖼️ No media, generating image from rewritten text (DALL-E)...")
-                final_image_url = await generate_image_from_description(rewritten_text)
-                if final_image_url:
-                    logger.info("✅ Generated image from text")
-                else:
-                    logger.warning("Text-to-image generation failed, sending text only")
-
-            # --- Post the result ---
-            if final_image_url:
-                await bot.send_photo(
-                    chat_id=target_id,
-                    photo=final_image_url,
-                    caption=rewritten_text[:1024]
-                )
-                logger.info(f"📸 Posted with new image to {target_id}")
-            else:
-                await bot.send_message(chat_id=target_id, text=rewritten_text)
-                logger.info(f"📝 Posted text-only to {target_id}")
+            # --- Text-only fallback ---
+            await bot.send_message(chat_id=target_id, text=rewritten_text)
+            logger.info("📝 Posted text-only")
 
             break
     except errors.rpcerrorlist.AuthKeyError as e:
-        logger.error(f"Authentication error: {e}. Restarting client...")
+        logger.error(f"Authentication error: {e}. Restarting...")
         await user_client.start(phone=PHONE)
     except Exception as e:
         logger.error(f"Error processing {source_id}: {e}")
@@ -140,23 +149,19 @@ async def process_channel(source_id, target_id):
 async def poll_channels():
     while True:
         if not await ensure_connection():
-            logger.warning("⚠️ Offline, waiting 10 seconds to retry...")
             await asyncio.sleep(10)
             continue
 
         clients = database.get_all_clients()
         if not clients:
-            logger.warning("⚠️ No clients in database – waiting...")
             await asyncio.sleep(10)
             continue
         for client in clients:
-            source = client["source"]
-            target = client["target"]
-            await process_channel(source, target)
+            await process_channel(client["source"], client["target"])
         await asyncio.sleep(5)
 
 async def main():
-    logger.info("Starting Telegram Rewriter Bot (Hybrid Mode with Auto-Reconnect)...")
+    logger.info("Starting Telegram Rewriter Bot (Multi-Image + Watermark Removal)...")
     
     await user_client.start(phone=PHONE)
     if not user_client.is_connected():
