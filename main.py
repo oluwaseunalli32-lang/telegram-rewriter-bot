@@ -29,55 +29,77 @@ if not BOT_TOKEN or not API_ID or not API_HASH or not PHONE:
 bot = Bot(token=BOT_TOKEN)
 user_client = TelegramClient('session_name', API_ID, API_HASH)
 
-SOURCE_CHANNEL_ID = -1003593544389
-TARGET_CHANNEL_ID = -1004415621706
+# ===== YOUR CHANNEL IDs (already set) =====
+SOURCE_CHANNEL_ID = -1003593544389   # CAPPERS FREE🚦
+TARGET_CHANNEL_ID = -1004415621706   # Caps_picks
 
 last_processed = {}
 
 async def process_channel(source_id, target_id):
-    """
-    Fetch the latest message from the source channel.
-    If it's new, process it (rewrite + regenerate image) and post to target.
-    """
+    global last_processed
     try:
         channel = await user_client.get_entity(source_id)
         async for msg in user_client.iter_messages(channel, limit=1):
-            # If we've already processed this message ID, skip
+            # Skip if already processed
             if msg.id == last_processed.get(source_id):
                 return
 
-            # Mark as processed immediately (prevents infinite loops)
+            # Mark as processed immediately
             last_processed[source_id] = msg.id
-
             logger.info(f"📩 New message in {source_id} (ID: {msg.id})")
 
-            # 1. Rewrite text
+            # --- Extract text ---
             original_text = msg.text or msg.caption or ""
             rewritten_text = await rewrite_text(original_text)
 
-            # 2. Check for media (photo or GIF)
+            # --- Detect media (photo, GIF, video) ---
             image_bytes = None
-            if msg.photo:
-                try:
-                    image_bytes = await user_client.download_media(msg.photo, bytes)
-                    if image_bytes:
-                        logger.info("✅ Downloaded photo bytes")
-                    else:
-                        logger.warning("Could not download photo")
-                except Exception as e:
-                    logger.error(f"Error downloading photo: {e}")
+            media = msg.media
 
-            elif msg.document and msg.document.mime_type and 'gif' in msg.document.mime_type:
-                try:
-                    image_bytes = await user_client.download_media(msg.document, bytes)
-                    if image_bytes:
-                        logger.info("✅ Downloaded GIF bytes")
-                    else:
-                        logger.warning("Could not download GIF")
-                except Exception as e:
-                    logger.error(f"Error downloading GIF: {e}")
+            if media:
+                logger.info(f"🔍 Media type: {type(media)}")
 
-            # 3. If we have image bytes, try to regenerate
+                # Check for photo (MessageMediaPhoto)
+                if hasattr(media, 'photo'):
+                    try:
+                        image_bytes = await user_client.download_media(media, bytes)
+                        if image_bytes:
+                            logger.info("✅ Downloaded photo bytes")
+                        else:
+                            logger.warning("Could not download photo")
+                    except Exception as e:
+                        logger.error(f"Error downloading photo: {e}")
+
+                # Check for document (could be GIF, image, video)
+                elif hasattr(media, 'document') and media.document:
+                    mime_type = media.document.mime_type
+                    if mime_type:
+                        if 'image' in mime_type:
+                            try:
+                                image_bytes = await user_client.download_media(media, bytes)
+                                if image_bytes:
+                                    logger.info(f"✅ Downloaded image ({mime_type}) bytes")
+                                else:
+                                    logger.warning(f"Could not download image ({mime_type})")
+                            except Exception as e:
+                                logger.error(f"Error downloading image: {e}")
+                        elif mime_type == 'image/gif':
+                            try:
+                                image_bytes = await user_client.download_media(media, bytes)
+                                if image_bytes:
+                                    logger.info("✅ Downloaded GIF bytes")
+                                else:
+                                    logger.warning("Could not download GIF")
+                            except Exception as e:
+                                logger.error(f"Error downloading GIF: {e}")
+                        elif 'video' in mime_type:
+                            logger.info("🎥 Video detected – skipping regeneration (video not supported)")
+                        else:
+                            logger.info(f"📄 Unsupported document type: {mime_type}")
+                    else:
+                        logger.warning("Document has no mime_type")
+
+            # --- Process image if we have bytes ---
             if image_bytes:
                 new_image_url = await regenerate_image_from_bytes(image_bytes)
                 if new_image_url:
@@ -88,7 +110,7 @@ async def process_channel(source_id, target_id):
                     )
                     logger.info(f"📸 Posted regenerated image to {target_id}")
                 else:
-                    # Fallback: send original image (as bytes)
+                    # Fallback: send original image
                     await bot.send_photo(
                         chat_id=target_id,
                         photo=BytesIO(image_bytes),
@@ -100,7 +122,6 @@ async def process_channel(source_id, target_id):
                 await bot.send_message(chat_id=target_id, text=rewritten_text)
                 logger.info(f"📝 Posted text-only to {target_id}")
 
-            # Exit the loop after processing the latest message
             break
     except Exception as e:
         logger.error(f"Error processing {source_id}: {e}")
@@ -123,7 +144,7 @@ async def main():
     await user_client.start(phone=PHONE)
     logger.info("User client connected!")
 
-    # Auto-register the client if not present
+    # Auto-register your client if not already in DB
     existing = database.get_target_for_source(SOURCE_CHANNEL_ID)
     if existing is None:
         logger.info(f"📝 Adding client: {SOURCE_CHANNEL_ID} → {TARGET_CHANNEL_ID}")
