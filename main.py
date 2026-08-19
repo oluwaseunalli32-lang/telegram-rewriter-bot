@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 from dotenv import load_dotenv
 from io import BytesIO
+from aiogram.types import BufferedInputFile  # ADD THIS IMPORT
 
 env_path = Path(__file__).parent / '.env'
 load_dotenv(dotenv_path=env_path)
@@ -36,7 +37,6 @@ ENABLE_IMAGE_FOR_TEXT = os.getenv("ENABLE_IMAGE_FOR_TEXT", "true").lower() == "t
 
 last_processed = {}
 
-# === NEW: Connection safety net ===
 async def ensure_connection():
     """Check if the client is connected. If not, reconnect."""
     if not user_client.is_connected():
@@ -56,7 +56,6 @@ async def ensure_connection():
 async def process_channel(source_id, target_id):
     global last_processed
     
-    # Step 0: Ensure we are connected BEFORE doing anything
     if not await ensure_connection():
         logger.error("❌ Cannot process: Client is disconnected and reconnection failed.")
         return
@@ -70,11 +69,9 @@ async def process_channel(source_id, target_id):
             last_processed[source_id] = msg.id
             logger.info(f"📩 New message in {source_id} (ID: {msg.id})")
 
-            # --- Rewrite text ---
             original_text = msg.text or msg.caption or ""
             rewritten_text = await rewrite_text(original_text)
 
-            # --- Check for media ---
             image_bytes = None
             media = msg.media
             final_image_url = None
@@ -90,7 +87,7 @@ async def process_channel(source_id, target_id):
                 except Exception as e:
                     logger.error(f"Error downloading media: {e}")
 
-            # --- Case 1: We have media (image/GIF) -> Regenerate using Vision + DALL-E ---
+            # --- Case 1: We have media -> Regenerate using Vision + DALL-E ---
             if image_bytes:
                 logger.info("🔄 Regenerating image via Vision + DALL-E (removing watermarks)...")
                 new_image_url = await regenerate_image_from_bytes(image_bytes)
@@ -98,16 +95,21 @@ async def process_channel(source_id, target_id):
                     final_image_url = new_image_url
                     logger.info("✅ Successfully regenerated image")
                 else:
+                    # FIXED FALLBACK – uses BufferedInputFile
                     logger.warning("Regeneration failed, falling back to original media")
+                    input_file = BufferedInputFile(
+                        file=image_bytes,
+                        filename="original_image.jpg"
+                    )
                     await bot.send_photo(
                         chat_id=target_id,
-                        photo=BytesIO(image_bytes),
+                        photo=input_file,
                         caption=rewritten_text[:1024]
                     )
                     logger.info(f"📸 Posted original media (regeneration failed) to {target_id}")
                     return
 
-            # --- Case 2: No media (text-only) -> Optionally generate image from text ---
+            # --- Case 2: No media -> Optionally generate image from text ---
             elif ENABLE_IMAGE_FOR_TEXT and rewritten_text and len(rewritten_text) > 10:
                 logger.info("🖼️ No media, generating image from rewritten text (DALL-E)...")
                 final_image_url = await generate_image_from_description(rewritten_text)
@@ -137,7 +139,6 @@ async def process_channel(source_id, target_id):
 
 async def poll_channels():
     while True:
-        # Ensure connection at the start of every loop iteration
         if not await ensure_connection():
             logger.warning("⚠️ Offline, waiting 10 seconds to retry...")
             await asyncio.sleep(10)
@@ -157,7 +158,6 @@ async def poll_channels():
 async def main():
     logger.info("Starting Telegram Rewriter Bot (Hybrid Mode with Auto-Reconnect)...")
     
-    # Initial connect
     await user_client.start(phone=PHONE)
     if not user_client.is_connected():
         await user_client.connect()
