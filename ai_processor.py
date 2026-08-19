@@ -2,6 +2,7 @@ import os
 import re
 import base64
 import time
+import asyncio
 import requests
 from io import BytesIO
 from PIL import Image
@@ -19,6 +20,10 @@ openai_client = OpenAI(
 # --- Config ---
 NEW_MENTION = os.getenv("NEW_MENTION", "")
 OLD_MENTION = "@cappersfree"
+
+# Global cooldown to prevent hitting OpenAI rate limits
+_last_vision_call = 0
+_vision_cooldown = 6  # seconds
 
 def clean_mentions(text: str) -> str:
     if not text:
@@ -64,7 +69,18 @@ async def rewrite_text(original_text: str) -> str:
         return original_text
 
 async def describe_image_bytes(image_bytes: bytes) -> str:
-    """Use GPT-4o with exponential backoff retries for 429 errors."""
+    """Use GPT-4o with rate‑limit protection and exponential backoff."""
+    global _last_vision_call
+
+    # Enforce global cooldown
+    now = time.time()
+    elapsed = now - _last_vision_call
+    if elapsed < _vision_cooldown:
+        wait = _vision_cooldown - elapsed
+        print(f"⏳ Waiting {wait:.1f}s to respect Vision rate limit...")
+        await asyncio.sleep(wait)
+    _last_vision_call = time.time()
+
     try:
         img = Image.open(BytesIO(image_bytes))
         if getattr(img, 'is_animated', False):
@@ -76,20 +92,17 @@ async def describe_image_bytes(image_bytes: bytes) -> str:
         img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
         data_url = f"data:image/jpeg;base64,{img_base64}"
 
+        # Shorter, clearer prompt
         vision_prompt = """
-        Describe this image in detail for the purpose of recreating it.
-
-        RULES:
-        1. KEEP all betting, sports, and game details: team names, league names, scores, odds, stake amounts, player names, and any numbers.
-        2. KEEP the overall layout, colors, style, and composition.
-        3. IGNORE and DO NOT MENTION any usernames (e.g., @cappersfree), channel handles, or social media tags.
-        4. IGNORE and DO NOT MENTION any logo branding (e.g., 'CF' or 'Cappers Free').
-        5. Just describe the visual scene, the important text (teams, odds, scores), and the layout.
-        Make the description clear and vivid, suitable as a prompt for DALL-E 3 to recreate a similar image without watermarks.
+        Describe this image in a few sentences.
+        - Keep all sports details: teams, odds, scores, players, numbers.
+        - Ignore any usernames (like @cappersfree) and logos (like CF).
+        - Describe layout, colors, and style.
+        Make it a concise prompt for DALL-E to recreate it without watermarks.
         """
 
-        max_retries = 5
-        base_delay = 1
+        max_retries = 4
+        base_delay = 2  # start with 2s
         for attempt in range(max_retries):
             try:
                 vision_response = openai_client.chat.completions.create(
@@ -103,16 +116,16 @@ async def describe_image_bytes(image_bytes: bytes) -> str:
                             ]
                         }
                     ],
-                    max_tokens=500
+                    max_tokens=300  # reduced for speed
                 )
                 description = vision_response.choices[0].message.content.strip()
-                print(f"Vision description (first 200 chars): {description[:200]}...")
+                print(f"Vision description (first 150 chars): {description[:150]}...")
                 return description
             except Exception as e:
                 if hasattr(e, 'status_code') and e.status_code == 429:
                     wait = base_delay * (2 ** attempt)
                     print(f"Rate limited (429). Retrying in {wait}s (attempt {attempt+1}/{max_retries})")
-                    time.sleep(wait)
+                    await asyncio.sleep(wait)
                 else:
                     print(f"Vision non‑429 error: {e}")
                     return None
@@ -126,8 +139,12 @@ async def generate_image_from_description(prompt: str) -> str:
     if not prompt or len(prompt) < 10:
         return None
     try:
-        # Flexible: use the description directly, preserving style and details.
-        final_prompt = f"Recreate the image described below, preserving its style, layout, and details, but without any watermarks or logos:\n\n{prompt}"
+        # Keep prompt short and clear – DALL-E 3 handles up to ~1000 chars, but we limit to 300
+        short_prompt = prompt[:300]
+        # Remove any problematic characters (like emojis or unusual symbols that might cause 400)
+        short_prompt = re.sub(r'[^\x00-\x7F]+', '', short_prompt)  # remove non-ASCII
+        final_prompt = f"Recreate this image without watermarks: {short_prompt}"
+        print(f"DALL-E prompt: {final_prompt[:100]}...")
         response = openai_client.images.generate(
             model="dall-e-3",
             prompt=final_prompt,
