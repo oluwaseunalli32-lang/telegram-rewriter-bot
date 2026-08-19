@@ -121,9 +121,8 @@ async def process_channel(source_id, target_id):
                 for idx, media in enumerate(media_list):
                     caption = rewritten_text[:1024] if idx == 0 else None
                     await process_single_media(media, caption, target_id)
-                    # Delay between media items to avoid rate limits
                     if idx < len(media_list) - 1:
-                        await asyncio.sleep(4)  # increased from 2
+                        await asyncio.sleep(4)  # delay between media
             else:
                 if ENABLE_IMAGE_FOR_TEXT and rewritten_text and len(rewritten_text) > 10:
                     logger.info("🖼️ Generating image from text...")
@@ -142,8 +141,8 @@ async def process_channel(source_id, target_id):
                     await bot.send_message(chat_id=target_id, text=rewritten_text)
                     logger.info("📝 Posted text-only")
 
-            # Delay between messages to avoid rate limits
-            await asyncio.sleep(8)  # increased from 3
+            # Delay between messages
+            await asyncio.sleep(8)
 
     except errors.rpcerrorlist.AuthKeyError as e:
         logger.error(f"Authentication error: {e}. Restarting...")
