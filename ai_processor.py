@@ -70,10 +70,8 @@ async def rewrite_text(original_text: str) -> str:
         return original_text
 
 async def describe_image_bytes(image_bytes: bytes) -> str:
-    """Use gpt-4o-mini for Vision with rate limiting and retries."""
     global _last_vision_call
 
-    # Enforce cooldown
     now = time.time()
     elapsed = now - _last_vision_call
     if elapsed < _vision_cooldown:
@@ -83,7 +81,6 @@ async def describe_image_bytes(image_bytes: bytes) -> str:
     _last_vision_call = time.time()
 
     try:
-        # Prepare image
         img = Image.open(BytesIO(image_bytes))
         if getattr(img, 'is_animated', False):
             img.seek(0)
@@ -94,7 +91,6 @@ async def describe_image_bytes(image_bytes: bytes) -> str:
         img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
         data_url = f"data:image/jpeg;base64,{img_base64}"
 
-        # Short, clear prompt
         vision_prompt = """
         Describe this image concisely. Keep all sports/betting details: team names, leagues, odds, scores, stakes.
         Describe the layout, colors, and style.
@@ -107,7 +103,7 @@ async def describe_image_bytes(image_bytes: bytes) -> str:
         for attempt in range(max_retries):
             try:
                 response = openai_client.chat.completions.create(
-                    model="gpt-4o-mini",  # faster, cheaper, good enough for this task
+                    model="gpt-4o-mini",
                     messages=[
                         {
                             "role": "user",
@@ -137,13 +133,11 @@ async def describe_image_bytes(image_bytes: bytes) -> str:
         return None
 
 async def generate_image_from_description(prompt: str) -> str:
-    """Generate image with DALL-E 3, respecting cooldown."""
     global _last_dalle_call
 
     if not prompt or len(prompt) < 10:
         return None
 
-    # Enforce cooldown
     now = time.time()
     elapsed = now - _last_dalle_call
     if elapsed < _dalle_cooldown:
@@ -152,24 +146,38 @@ async def generate_image_from_description(prompt: str) -> str:
         await asyncio.sleep(wait)
     _last_dalle_call = time.time()
 
-    try:
-        # Clean prompt: remove non-ASCII, limit length
-        clean_prompt = re.sub(r'[^\x00-\x7F]+', '', prompt)  # remove emojis/special chars
-        if len(clean_prompt) > 300:
-            clean_prompt = clean_prompt[:300] + "..."
-        final_prompt = f"Recreate this image without any watermarks or logos: {clean_prompt}"
-        print(f"🎨 DALL-E prompt: {final_prompt[:100]}...")
-        response = openai_client.images.generate(
-            model="dall-e-3",
-            prompt=final_prompt,
-            size="1024x1024",
-            quality="standard",
-            n=1
-        )
-        return response.data[0].url
-    except Exception as e:
-        print(f"❌ DALL-E error: {e}")
-        return None
+    # Clean prompt
+    clean_prompt = re.sub(r'[^\x00-\x7F]+', '', prompt)
+    if len(clean_prompt) > 300:
+        clean_prompt = clean_prompt[:300] + "..."
+    final_prompt = f"Recreate this image without any watermarks or logos: {clean_prompt}"
+
+    # Try DALL-E 3, fallback to DALL-E 2
+    models_to_try = ["dall-e-3", "dall-e-2"]
+    last_error = None
+
+    for model in models_to_try:
+        try:
+            print(f"🎨 Trying {model} with prompt: {final_prompt[:100]}...")
+            response = openai_client.images.generate(
+                model=model,
+                prompt=final_prompt,
+                size="1024x1024" if model == "dall-e-3" else "1024x1024",  # both support this size
+                quality="standard" if model == "dall-e-3" else None,
+                n=1
+            )
+            return response.data[0].url
+        except Exception as e:
+            print(f"❌ {model} error: {e}")
+            last_error = e
+            # If the error says the model doesn't exist, try next
+            if "does not exist" in str(e):
+                continue
+            else:
+                # Other errors (rate limit, content policy) – break and return None
+                break
+    print(f"❌ All DALL-E models failed. Last error: {last_error}")
+    return None
 
 async def regenerate_image_from_bytes(image_bytes: bytes) -> str:
     description = await describe_image_bytes(image_bytes)
