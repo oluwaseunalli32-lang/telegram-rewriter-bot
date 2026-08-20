@@ -105,7 +105,8 @@ async def process_channel(source_id, target_id):
         for msg in new_messages:
             logger.info(f"📩 Processing message ID: {msg.id}")
 
-            original_text = msg.text or msg.caption or ""
+            # --- FIX: handle missing caption attribute ---
+            original_text = msg.text or getattr(msg, 'caption', '') or ""
             rewritten_text = await rewrite_text(original_text)
 
             media_list = []
