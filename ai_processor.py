@@ -134,6 +134,7 @@ async def describe_image_bytes(image_bytes: bytes) -> str:
 async def generate_image_from_description(prompt: str) -> str:
     global _last_generation_call
     if not prompt or len(prompt) < 10:
+        print("⚠️ Prompt too short for image generation.")
         return None
 
     now = time.time()
@@ -150,7 +151,6 @@ async def generate_image_from_description(prompt: str) -> str:
         clean_prompt = clean_prompt[:300] + "..."
     final_prompt = f"Recreate this image without any watermarks or logos: {clean_prompt}"
 
-    # --- THE FIX: Remove 'quality' parameter (only DALL-E uses it) ---
     try:
         print(f"🎨 Trying OpenAI GPT Image 2...")
         response = openai_client.images.generate(
@@ -158,9 +158,17 @@ async def generate_image_from_description(prompt: str) -> str:
             prompt=final_prompt,
             size="1024x1024",
             n=1
-            # QUALITY IS REMOVED – it was causing the 400 error!
         )
-        return response.data[0].url
+        # DEBUG: print the full response
+        print(f"📦 Full response: {response}")
+        # The URL is usually in response.data[0].url
+        if response.data and len(response.data) > 0:
+            image_url = response.data[0].url
+            print(f"✅ Generated image URL: {image_url}")
+            return image_url
+        else:
+            print("❌ No data in response.")
+            return None
     except Exception as e:
         print(f"❌ OpenAI GPT Image 2 failed: {e}")
         return None
