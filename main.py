@@ -63,7 +63,6 @@ async def process_single_media(media, caption_text, target_id):
         new_image_data = await regenerate_image_from_bytes(image_bytes)
         
         if new_image_data:
-            # new_image_data is either URL (str) or BufferedInputFile
             await bot.send_photo(
                 chat_id=target_id,
                 photo=new_image_data,
@@ -93,6 +92,7 @@ async def process_channel(source_id, target_id):
         channel = await user_client.get_entity(source_id)
         last_id = last_processed.get(source_id, 0)
         
+        # Fetch all messages newer than last_id, in chronological order
         new_messages = []
         async for msg in user_client.iter_messages(channel, min_id=last_id, reverse=True):
             new_messages.append(msg)
