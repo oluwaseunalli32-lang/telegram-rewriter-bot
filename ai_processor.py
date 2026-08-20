@@ -133,12 +133,10 @@ async def describe_image_bytes(image_bytes: bytes) -> str:
         return None
 
 async def generate_image_from_description(prompt: str):
-    """
-    Generate image using gpt-image-2.
-    Returns either a BufferedInputFile (ready to send) or None on failure.
-    """
+    """Generate image using gpt-image-2 with proper error logging."""
     global _last_generation_call
     if not prompt or len(prompt) < 10:
+        print("⚠️ Prompt too short for image generation.")
         return None
 
     now = time.time()
@@ -149,30 +147,34 @@ async def generate_image_from_description(prompt: str):
         await asyncio.sleep(wait)
     _last_generation_call = time.time()
 
-    # Clean prompt
-    clean_prompt = re.sub(r'[^\x00-\x7F]+', '', prompt)
-    if len(clean_prompt) > 300:
-        clean_prompt = clean_prompt[:300] + "..."
-    final_prompt = f"Recreate this image without any watermarks or logos: {clean_prompt}"
+    # Clean and shorten prompt – gpt-image-2 is strict
+    clean_prompt = re.sub(r'[^a-zA-Z0-9\s\-+]', '', prompt)
+    if len(clean_prompt) > 200:
+        clean_prompt = clean_prompt[:200] + "..."
+    final_prompt = f"Sports betting graphic: {clean_prompt}"
 
     try:
-        print(f"🎨 Trying OpenAI GPT Image 2...")
+        print(f"🎨 Trying GPT Image 2 with prompt: {final_prompt[:80]}...")
+        
+        # CRITICAL: Do NOT include 'quality' or 'response_format' parameters
+        # gpt-image-2 rejects them with 400 error
         response = openai_client.images.generate(
             model="gpt-image-2",
             prompt=final_prompt,
             size="1024x1024",
             n=1
         )
-        print(f"📦 Full response: {response}")
+        
+        # Log the full response for debugging
+        print(f"📦 Response status: success")
+        if hasattr(response, '_request_id'):
+            print(f"🔑 Request ID: {response._request_id}")
 
-        # Check if we got b64_json
         if response.data and len(response.data) > 0:
             img_data = response.data[0]
             if img_data.b64_json:
-                # Decode base64 to bytes
                 image_bytes = base64.b64decode(img_data.b64_json)
-                # Create BufferedInputFile for sending
-                input_file = BufferedInputFile(file=image_bytes, filename="generated_image.png")
+                input_file = BufferedInputFile(file=image_bytes, filename="generated.png")
                 print("✅ Generated image from base64")
                 return input_file
             elif img_data.url:
@@ -180,12 +182,42 @@ async def generate_image_from_description(prompt: str):
                 return img_data.url
         print("❌ No image data in response.")
         return None
+        
     except Exception as e:
-        print(f"❌ OpenAI GPT Image 2 failed: {e}")
+        # Print FULL error details for debugging
+        print(f"❌ OpenAI GPT Image 2 error: {e}")
+        
+        # Try to extract more details from the error
+        if hasattr(e, 'response'):
+            print(f"📄 Response body: {e.response.text}")
+        if hasattr(e, 'status_code'):
+            print(f"📊 Status code: {e.status_code}")
+        if hasattr(e, 'request_id'):
+            print(f"🔑 Request ID: {e.request_id}")
+        
+        # Fallback: try with an even simpler prompt
+        try:
+            print("🔄 Trying fallback with generic prompt...")
+            response = openai_client.images.generate(
+                model="gpt-image-2",
+                prompt="Sports betting odds graphic, clean modern style",
+                size="1024x1024",
+                n=1
+            )
+            if response.data and len(response.data) > 0:
+                img_data = response.data[0]
+                if img_data.b64_json:
+                    image_bytes = base64.b64decode(img_data.b64_json)
+                    print("✅ Fallback succeeded")
+                    return BufferedInputFile(file=image_bytes, filename="fallback.png")
+        except Exception as e2:
+            print(f"❌ Fallback also failed: {e2}")
+            if hasattr(e2, 'response'):
+                print(f"📄 Fallback response: {e2.response.text}")
+        
         return None
 
 async def regenerate_image_from_bytes(image_bytes: bytes):
-    """Full pipeline: Vision description → generate new image."""
     description = await describe_image_bytes(image_bytes)
     if not description:
         return None
