@@ -6,6 +6,7 @@ import asyncio
 from io import BytesIO
 from PIL import Image
 from openai import OpenAI
+import replicate
 
 # --- Clients ---
 deepseek_client = OpenAI(
@@ -20,11 +21,11 @@ openai_client = OpenAI(
 NEW_MENTION = os.getenv("NEW_MENTION", "")
 OLD_MENTION = "@cappersfree"
 
-# Rate limit protection
+# 速率限制保护
 _last_vision_call = 0
-_vision_cooldown = 8  # seconds between Vision calls
-_last_dalle_call = 0
-_dalle_cooldown = 10  # seconds between DALL-E calls
+_vision_cooldown = 8  # 两次 Vision 调用间隔（秒）
+_last_generation_call = 0
+_generation_cooldown = 8  # 两次图像生成调用间隔（秒）
 
 def clean_mentions(text: str) -> str:
     if not text:
@@ -70,13 +71,15 @@ async def rewrite_text(original_text: str) -> str:
         return original_text
 
 async def describe_image_bytes(image_bytes: bytes) -> str:
+    """使用 gpt-4o-mini 进行图像描述，带速率限制和重试。"""
     global _last_vision_call
 
+    # 强制冷却
     now = time.time()
     elapsed = now - _last_vision_call
     if elapsed < _vision_cooldown:
         wait = _vision_cooldown - elapsed
-        print(f"⏳ Waiting {wait:.1f}s before next Vision call...")
+        print(f"⏳ 等待 {wait:.1f}s 后进行下一次 Vision 调用...")
         await asyncio.sleep(wait)
     _last_vision_call = time.time()
 
@@ -95,7 +98,7 @@ async def describe_image_bytes(image_bytes: bytes) -> str:
         Describe this image concisely. Keep all sports/betting details: team names, leagues, odds, scores, stakes.
         Describe the layout, colors, and style.
         Ignore any usernames (like @cappersfree) and logos (like CF).
-        Output a short description suitable for DALL-E to recreate the image without watermarks.
+        Output a short description suitable for an image generation model to recreate the image without watermarks.
         """
 
         max_retries = 4
@@ -116,68 +119,84 @@ async def describe_image_bytes(image_bytes: bytes) -> str:
                     max_tokens=300
                 )
                 description = response.choices[0].message.content.strip()
-                print(f"✅ Vision description: {description[:150]}...")
+                print(f"✅ Vision 描述: {description[:150]}...")
                 return description
             except Exception as e:
                 if hasattr(e, 'status_code') and e.status_code == 429:
                     wait = base_delay * (2 ** attempt)
-                    print(f"⚠️ Rate limit (429). Retry {attempt+1}/{max_retries} in {wait}s")
+                    print(f"⚠️ 速率限制 (429)。第 {attempt+1}/{max_retries} 次重试，等待 {wait}s")
                     await asyncio.sleep(wait)
                 else:
-                    print(f"❌ Vision error: {e}")
+                    print(f"❌ Vision 错误: {e}")
                     return None
-        print("❌ Vision failed after all retries")
+        print("❌ Vision 重试全部失败")
         return None
     except Exception as e:
-        print(f"❌ Vision preparation error: {e}")
+        print(f"❌ Vision 准备错误: {e}")
         return None
 
 async def generate_image_from_description(prompt: str) -> str:
-    global _last_dalle_call
+    """使用 OpenAI DALL-E（如可用），否则回退到 Replicate SDXL。"""
+    global _last_generation_call
 
     if not prompt or len(prompt) < 10:
         return None
 
+    # 强制冷却
     now = time.time()
-    elapsed = now - _last_dalle_call
-    if elapsed < _dalle_cooldown:
-        wait = _dalle_cooldown - elapsed
-        print(f"⏳ Waiting {wait:.1f}s before next DALL-E call...")
+    elapsed = now - _last_generation_call
+    if elapsed < _generation_cooldown:
+        wait = _generation_cooldown - elapsed
+        print(f"⏳ 等待 {wait:.1f}s 后进行下一次生成...")
         await asyncio.sleep(wait)
-    _last_dalle_call = time.time()
+    _last_generation_call = time.time()
 
-    # Clean prompt
+    # 清理提示词
     clean_prompt = re.sub(r'[^\x00-\x7F]+', '', prompt)
     if len(clean_prompt) > 300:
         clean_prompt = clean_prompt[:300] + "..."
     final_prompt = f"Recreate this image without any watermarks or logos: {clean_prompt}"
 
-    # Try DALL-E 3, fallback to DALL-E 2
-    models_to_try = ["dall-e-3", "dall-e-2"]
-    last_error = None
-
-    for model in models_to_try:
+    # 首先尝试 OpenAI DALL-E
+    try:
+        print(f"🎨 尝试 OpenAI DALL-E...")
+        response = openai_client.images.generate(
+            model="dall-e-3",
+            prompt=final_prompt,
+            size="1024x1024",
+            quality="standard",
+            n=1
+        )
+        return response.data[0].url
+    except Exception as e:
+        print(f"❌ DALL-E 失败: {e}. 回退到 Replicate SDXL...")
+        # 回退到 Replicate SDXL
+        replicate_api_token = os.getenv("REPLICATE_API_TOKEN")
+        if not replicate_api_token:
+            print("⚠️ 未设置 REPLICATE_API_TOKEN。无法生成图像。")
+            return None
         try:
-            print(f"🎨 Trying {model} with prompt: {final_prompt[:100]}...")
-            response = openai_client.images.generate(
-                model=model,
-                prompt=final_prompt,
-                size="1024x1024" if model == "dall-e-3" else "1024x1024",  # both support this size
-                quality="standard" if model == "dall-e-3" else None,
-                n=1
+            # 使用 SDXL 模型
+            output = replicate.run(
+                "stability-ai/sdxl:39ed52f2a78e934b3ba6e2a89f5b1c712de7dfea535525255b1aa35c5565e08b",
+                input={
+                    "prompt": final_prompt,
+                    "width": 1024,
+                    "height": 1024,
+                    "num_outputs": 1,
+                    "scheduler": "K_EULER",
+                    "num_inference_steps": 25,
+                    "guidance_scale": 7.5
+                }
             )
-            return response.data[0].url
-        except Exception as e:
-            print(f"❌ {model} error: {e}")
-            last_error = e
-            # If the error says the model doesn't exist, try next
-            if "does not exist" in str(e):
-                continue
+            # output 是一个 URL 列表
+            if output and len(output) > 0:
+                return output[0]
             else:
-                # Other errors (rate limit, content policy) – break and return None
-                break
-    print(f"❌ All DALL-E models failed. Last error: {last_error}")
-    return None
+                return None
+        except Exception as e2:
+            print(f"❌ Replicate SDXL 错误: {e2}")
+            return None
 
 async def regenerate_image_from_bytes(image_bytes: bytes) -> str:
     description = await describe_image_bytes(image_bytes)
