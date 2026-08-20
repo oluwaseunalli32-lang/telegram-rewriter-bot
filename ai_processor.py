@@ -6,6 +6,7 @@ import asyncio
 from io import BytesIO
 from PIL import Image
 from openai import OpenAI
+from aiogram.types import BufferedInputFile
 
 # --- Clients ---
 deepseek_client = OpenAI(
@@ -52,7 +53,7 @@ async def rewrite_text(original_text: str) -> str:
         response = deepseek_client.chat.completions.create(
             model="deepseek-chat",
             messages=[
-                {"role": "system", "content": "Rewrite the following text to make it unique while preserving the core meaning. Return ONLY the rewritten text, nothing else. Do not add prefixes."},
+                {"role": "system", "content": "Rewrite the following text to make it unique while preserving the core meaning. Return ONLY the rewritten text, nothing else. Do not add prefixes like 'Here is the rewritten text' or 'Rewritten version:'. Just output the rewritten content."},
                 {"role": "user", "content": cleaned}
             ],
             temperature=0.8,
@@ -131,10 +132,13 @@ async def describe_image_bytes(image_bytes: bytes) -> str:
         print(f"❌ Vision preparation error: {e}")
         return None
 
-async def generate_image_from_description(prompt: str) -> str:
+async def generate_image_from_description(prompt: str):
+    """
+    Generate image using gpt-image-2.
+    Returns either a BufferedInputFile (ready to send) or None on failure.
+    """
     global _last_generation_call
     if not prompt or len(prompt) < 10:
-        print("⚠️ Prompt too short for image generation.")
         return None
 
     now = time.time()
@@ -159,21 +163,29 @@ async def generate_image_from_description(prompt: str) -> str:
             size="1024x1024",
             n=1
         )
-        # DEBUG: print the full response
         print(f"📦 Full response: {response}")
-        # The URL is usually in response.data[0].url
+
+        # Check if we got b64_json
         if response.data and len(response.data) > 0:
-            image_url = response.data[0].url
-            print(f"✅ Generated image URL: {image_url}")
-            return image_url
-        else:
-            print("❌ No data in response.")
-            return None
+            img_data = response.data[0]
+            if img_data.b64_json:
+                # Decode base64 to bytes
+                image_bytes = base64.b64decode(img_data.b64_json)
+                # Create BufferedInputFile for sending
+                input_file = BufferedInputFile(file=image_bytes, filename="generated_image.png")
+                print("✅ Generated image from base64")
+                return input_file
+            elif img_data.url:
+                print(f"✅ Generated image URL: {img_data.url}")
+                return img_data.url
+        print("❌ No image data in response.")
+        return None
     except Exception as e:
         print(f"❌ OpenAI GPT Image 2 failed: {e}")
         return None
 
-async def regenerate_image_from_bytes(image_bytes: bytes) -> str:
+async def regenerate_image_from_bytes(image_bytes: bytes):
+    """Full pipeline: Vision description → generate new image."""
     description = await describe_image_bytes(image_bytes)
     if not description:
         return None
