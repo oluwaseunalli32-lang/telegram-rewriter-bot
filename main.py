@@ -60,12 +60,13 @@ async def process_single_media(media, caption_text, target_id):
             return
 
         logger.info("🔄 Regenerating image via Vision + DALL-E...")
-        new_image_url = await regenerate_image_from_bytes(image_bytes)
+        new_image_data = await regenerate_image_from_bytes(image_bytes)
         
-        if new_image_url:
+        if new_image_data:
+            # new_image_data is either URL (str) or BufferedInputFile
             await bot.send_photo(
                 chat_id=target_id,
-                photo=new_image_url,
+                photo=new_image_data,
                 caption=caption_text[:1024] if caption_text else None
             )
             logger.info("📸 Posted regenerated image")
@@ -92,7 +93,6 @@ async def process_channel(source_id, target_id):
         channel = await user_client.get_entity(source_id)
         last_id = last_processed.get(source_id, 0)
         
-        # Fetch all messages newer than last_id, in chronological order
         new_messages = []
         async for msg in user_client.iter_messages(channel, min_id=last_id, reverse=True):
             new_messages.append(msg)
@@ -105,7 +105,6 @@ async def process_channel(source_id, target_id):
         for msg in new_messages:
             logger.info(f"📩 Processing message ID: {msg.id}")
 
-            # --- FIX: handle missing caption attribute ---
             original_text = msg.text or getattr(msg, 'caption', '') or ""
             rewritten_text = await rewrite_text(original_text)
 
@@ -123,15 +122,15 @@ async def process_channel(source_id, target_id):
                     caption = rewritten_text[:1024] if idx == 0 else None
                     await process_single_media(media, caption, target_id)
                     if idx < len(media_list) - 1:
-                        await asyncio.sleep(4)  # delay between media
+                        await asyncio.sleep(4)
             else:
                 if ENABLE_IMAGE_FOR_TEXT and rewritten_text and len(rewritten_text) > 10:
                     logger.info("🖼️ Generating image from text...")
-                    image_url = await generate_image_from_description(rewritten_text)
-                    if image_url:
+                    image_data = await generate_image_from_description(rewritten_text)
+                    if image_data:
                         await bot.send_photo(
                             chat_id=target_id,
-                            photo=image_url,
+                            photo=image_data,
                             caption=rewritten_text[:1024]
                         )
                         logger.info("📸 Posted generated image from text")
@@ -142,7 +141,6 @@ async def process_channel(source_id, target_id):
                     await bot.send_message(chat_id=target_id, text=rewritten_text)
                     logger.info("📝 Posted text-only")
 
-            # Delay between messages
             await asyncio.sleep(8)
 
     except errors.rpcerrorlist.AuthKeyError as e:
