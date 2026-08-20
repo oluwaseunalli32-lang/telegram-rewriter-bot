@@ -6,7 +6,6 @@ import asyncio
 from io import BytesIO
 from PIL import Image
 from openai import OpenAI
-import replicate
 
 # --- Clients ---
 deepseek_client = OpenAI(
@@ -53,7 +52,7 @@ async def rewrite_text(original_text: str) -> str:
         response = deepseek_client.chat.completions.create(
             model="deepseek-chat",
             messages=[
-                {"role": "system", "content": "Rewrite the following text to make it unique while preserving the core meaning. Return ONLY the rewritten text, nothing else. Do not add prefixes like 'Here is the rewritten text' or 'Rewritten version:'. Just output the rewritten content."},
+                {"role": "system", "content": "Rewrite the following text to make it unique while preserving the core meaning. Return ONLY the rewritten text, nothing else. Do not add prefixes."},
                 {"role": "user", "content": cleaned}
             ],
             temperature=0.8,
@@ -145,48 +144,26 @@ async def generate_image_from_description(prompt: str) -> str:
         await asyncio.sleep(wait)
     _last_generation_call = time.time()
 
+    # Clean prompt
     clean_prompt = re.sub(r'[^\x00-\x7F]+', '', prompt)
     if len(clean_prompt) > 300:
         clean_prompt = clean_prompt[:300] + "..."
     final_prompt = f"Recreate this image without any watermarks or logos: {clean_prompt}"
 
-    # Try OpenAI GPT Image 2 (your account has this)
+    # --- THE FIX: Remove 'quality' parameter (only DALL-E uses it) ---
     try:
         print(f"🎨 Trying OpenAI GPT Image 2...")
         response = openai_client.images.generate(
-            model="gpt-image-2",  # <-- CORRECT MODEL NAME
+            model="gpt-image-2",
             prompt=final_prompt,
             size="1024x1024",
-            quality="standard",
             n=1
+            # QUALITY IS REMOVED – it was causing the 400 error!
         )
         return response.data[0].url
     except Exception as e:
-        print(f"❌ OpenAI GPT Image 2 failed: {e}. Falling back to Replicate SDXL...")
-        replicate_api_token = os.getenv("REPLICATE_API_TOKEN")
-        if not replicate_api_token:
-            print("⚠️ No REPLICATE_API_TOKEN set. Cannot generate image.")
-            return None
-        try:
-            output = replicate.run(
-                "stability-ai/sdxl:39ed52f2a78e934b3ba6e2a89f5b1c712de7dfea535525255b1aa35c5565e08b",
-                input={
-                    "prompt": final_prompt,
-                    "width": 1024,
-                    "height": 1024,
-                    "num_outputs": 1,
-                    "scheduler": "K_EULER",
-                    "num_inference_steps": 25,
-                    "guidance_scale": 7.5
-                }
-            )
-            if output and len(output) > 0:
-                return output[0]
-            else:
-                return None
-        except Exception as e2:
-            print(f"❌ Replicate SDXL error: {e2}")
-            return None
+        print(f"❌ OpenAI GPT Image 2 failed: {e}")
+        return None
 
 async def regenerate_image_from_bytes(image_bytes: bytes) -> str:
     description = await describe_image_bytes(image_bytes)
