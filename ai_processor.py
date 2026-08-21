@@ -21,7 +21,6 @@ openai_client = OpenAI(
 NEW_MENTION = os.getenv("NEW_MENTION", "")
 OLD_MENTION = "@cappersfree"
 
-# Rate-limit protection
 _last_vision_call = 0
 _vision_cooldown = 8
 _last_generation_call = 0
@@ -53,7 +52,7 @@ async def rewrite_text(original_text: str) -> str:
         response = deepseek_client.chat.completions.create(
             model="deepseek-chat",
             messages=[
-                {"role": "system", "content": "Rewrite the following text to make it unique while preserving the core meaning. Return ONLY the rewritten text, nothing else. Do not add prefixes like 'Here is the rewritten text' or 'Rewritten version:'. Just output the rewritten content."},
+                {"role": "system", "content": "Rewrite the following text to make it unique while preserving the core meaning. Return ONLY the rewritten text, nothing else. Do not add prefixes."},
                 {"role": "user", "content": cleaned}
             ],
             temperature=0.8,
@@ -91,11 +90,12 @@ async def describe_image_bytes(image_bytes: bytes) -> str:
         img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
         data_url = f"data:image/jpeg;base64,{img_base64}"
 
+        # Detailed prompt – keep all text, numbers, team names, odds, layout
         vision_prompt = """
-        Describe this image concisely. Keep all sports/betting details: team names, leagues, odds, scores, stakes.
-        Describe the layout, colors, and style.
-        Ignore any usernames (like @cappersfree) and logos (like CF).
-        Output a short description suitable for an image generation model to recreate the image without watermarks.
+        Describe this image in detail. Include all visible text, numbers, team names, league names, odds, scores, stake amounts.
+        Describe the layout, colors, font styles, and overall design.
+        Do NOT mention any usernames (like @cappersfree) or logo branding (like CF).
+        Output a clear, vivid description that would allow an image generation model to recreate this exact image without watermarks.
         """
 
         max_retries = 4
@@ -113,10 +113,10 @@ async def describe_image_bytes(image_bytes: bytes) -> str:
                             ]
                         }
                     ],
-                    max_tokens=300
+                    max_tokens=500  # increase to get more details
                 )
                 description = response.choices[0].message.content.strip()
-                print(f"✅ Vision description: {description[:150]}...")
+                print(f"✅ Vision description: {description[:200]}...")
                 return description
             except Exception as e:
                 if hasattr(e, 'status_code') and e.status_code == 429:
@@ -133,10 +133,8 @@ async def describe_image_bytes(image_bytes: bytes) -> str:
         return None
 
 async def generate_image_from_description(prompt: str):
-    """Generate image using gpt-image-2 with proper error logging."""
     global _last_generation_call
     if not prompt or len(prompt) < 10:
-        print("⚠️ Prompt too short for image generation.")
         return None
 
     now = time.time()
@@ -147,17 +145,20 @@ async def generate_image_from_description(prompt: str):
         await asyncio.sleep(wait)
     _last_generation_call = time.time()
 
-    # Clean and shorten prompt – gpt-image-2 is strict
-    clean_prompt = re.sub(r'[^a-zA-Z0-9\s\-+]', '', prompt)
-    if len(clean_prompt) > 200:
-        clean_prompt = clean_prompt[:200] + "..."
-    final_prompt = f"Sports betting graphic: {clean_prompt}"
+    # Use the full description – keep all details
+    # Only clean up excessive whitespace, do NOT strip characters
+    clean_prompt = re.sub(r'\s+', ' ', prompt).strip()
+    # Limit to 500 characters to avoid token limits (DALL-E can handle more, but safe)
+    if len(clean_prompt) > 500:
+        clean_prompt = clean_prompt[:500] + "..."
+    
+    # Better instruction: recreate the described image without watermarks
+    final_prompt = f"Recreate this image exactly as described, without any watermarks or logos: {clean_prompt}"
 
     try:
-        print(f"🎨 Trying GPT Image 2 with prompt: {final_prompt[:80]}...")
+        print(f"🎨 Trying GPT Image 2 with prompt: {final_prompt[:100]}...")
         
-        # CRITICAL: Do NOT include 'quality' or 'response_format' parameters
-        # gpt-image-2 rejects them with 400 error
+        # CRITICAL: No 'quality' or 'response_format' parameters
         response = openai_client.images.generate(
             model="gpt-image-2",
             prompt=final_prompt,
@@ -165,8 +166,7 @@ async def generate_image_from_description(prompt: str):
             n=1
         )
         
-        # Log the full response for debugging
-        print(f"📦 Response status: success")
+        print(f"📦 Response received successfully")
         if hasattr(response, '_request_id'):
             print(f"🔑 Request ID: {response._request_id}")
 
@@ -184,10 +184,7 @@ async def generate_image_from_description(prompt: str):
         return None
         
     except Exception as e:
-        # Print FULL error details for debugging
         print(f"❌ OpenAI GPT Image 2 error: {e}")
-        
-        # Try to extract more details from the error
         if hasattr(e, 'response'):
             print(f"📄 Response body: {e.response.text}")
         if hasattr(e, 'status_code'):
@@ -195,25 +192,29 @@ async def generate_image_from_description(prompt: str):
         if hasattr(e, 'request_id'):
             print(f"🔑 Request ID: {e.request_id}")
         
-        # Fallback: try with an even simpler prompt
-        try:
-            print("🔄 Trying fallback with generic prompt...")
-            response = openai_client.images.generate(
-                model="gpt-image-2",
-                prompt="Sports betting odds graphic, clean modern style",
-                size="1024x1024",
-                n=1
-            )
-            if response.data and len(response.data) > 0:
-                img_data = response.data[0]
-                if img_data.b64_json:
-                    image_bytes = base64.b64decode(img_data.b64_json)
-                    print("✅ Fallback succeeded")
-                    return BufferedInputFile(file=image_bytes, filename="fallback.png")
-        except Exception as e2:
-            print(f"❌ Fallback also failed: {e2}")
-            if hasattr(e2, 'response'):
-                print(f"📄 Fallback response: {e2.response.text}")
+        # Fallback: only try generic if the custom prompt fails with a specific error
+        # But if it's a content policy violation, generic might also fail.
+        # So we'll only fallback if the error is not a content policy.
+        error_str = str(e).lower()
+        if "content_policy" not in error_str and "moderation" not in error_str:
+            try:
+                print("🔄 Trying fallback with generic prompt...")
+                response = openai_client.images.generate(
+                    model="gpt-image-2",
+                    prompt="A sports betting graphic with teams and odds, clean modern style",
+                    size="1024x1024",
+                    n=1
+                )
+                if response.data and len(response.data) > 0:
+                    img_data = response.data[0]
+                    if img_data.b64_json:
+                        image_bytes = base64.b64decode(img_data.b64_json)
+                        print("✅ Fallback succeeded")
+                        return BufferedInputFile(file=image_bytes, filename="fallback.png")
+            except Exception as e2:
+                print(f"❌ Fallback also failed: {e2}")
+        else:
+            print("❌ Content policy violation – cannot generate.")
         
         return None
 
