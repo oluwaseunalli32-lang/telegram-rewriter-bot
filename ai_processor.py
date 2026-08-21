@@ -8,7 +8,6 @@ from PIL import Image
 from openai import OpenAI
 from aiogram.types import BufferedInputFile
 
-# --- Clients ---
 deepseek_client = OpenAI(
     api_key=os.getenv("DEEPSEEK_API_KEY"),
     base_url="https://api.deepseek.com/v1"
@@ -17,7 +16,6 @@ openai_client = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY")
 )
 
-# --- Config ---
 NEW_MENTION = os.getenv("NEW_MENTION", "")
 OLD_MENTION = "@cappersfree"
 
@@ -90,12 +88,23 @@ async def describe_image_bytes(image_bytes: bytes) -> str:
         img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
         data_url = f"data:image/jpeg;base64,{img_base64}"
 
-        # Detailed prompt – keep all text, numbers, team names, odds, layout
         vision_prompt = """
-        Describe this image in detail. Include all visible text, numbers, team names, league names, odds, scores, stake amounts.
-        Describe the layout, colors, font styles, and overall design.
-        Do NOT mention any usernames (like @cappersfree) or logo branding (like CF).
-        Output a clear, vivid description that would allow an image generation model to recreate this exact image without watermarks.
+        You are a forensic image analyst. Describe the image with absolute precision.
+        You MUST output a structured blueprint that an AI could use to reproduce the image exactly.
+
+        INCLUDE:
+        1. Exact text content: every word, number, team name, league, odds, score, stake, date, time.
+        2. Exact position of each text element (e.g., 'top-left', 'center', 'bottom-right', 'x%, y%').
+        3. Exact colors: background color, text colors, border colors (use hex codes if possible).
+        4. Font styles: bold, italic, size (if discernible), font family (if known).
+        5. Layout: boxes, borders, shading, gradients, rounded corners, shadows.
+        6. Decorative elements: lines, icons, logos (describe them but note they are watermarks to ignore).
+        7. Overall style: modern, classic, dark/light mode, etc.
+
+        IMPORTANT: IGNORE and do NOT mention any usernames (like @cappersfree), channel names, or 'CF' logos.
+        These are watermarks and should be excluded.
+
+        Output the description in plain English, but make it so detailed that an artist could paint a perfect replica without ever seeing the original.
         """
 
         max_retries = 4
@@ -113,10 +122,12 @@ async def describe_image_bytes(image_bytes: bytes) -> str:
                             ]
                         }
                     ],
-                    max_tokens=500  # increase to get more details
+                    max_tokens=1000
                 )
                 description = response.choices[0].message.content.strip()
-                print(f"✅ Vision description: {description[:200]}...")
+                print(f"✅ Vision description (first 300 chars): {description[:300]}...")
+                # Log the full description so you can verify it's detailed
+                print(f"📝 FULL VISION DESCRIPTION:\n{description}")
                 return description
             except Exception as e:
                 if hasattr(e, 'status_code') and e.status_code == 429:
@@ -126,7 +137,6 @@ async def describe_image_bytes(image_bytes: bytes) -> str:
                 else:
                     print(f"❌ Vision error: {e}")
                     return None
-        print("❌ Vision failed after all retries")
         return None
     except Exception as e:
         print(f"❌ Vision preparation error: {e}")
@@ -145,77 +155,49 @@ async def generate_image_from_description(prompt: str):
         await asyncio.sleep(wait)
     _last_generation_call = time.time()
 
-    # Use the full description – keep all details
-    # Only clean up excessive whitespace, do NOT strip characters
-    clean_prompt = re.sub(r'\s+', ' ', prompt).strip()
-    # Limit to 500 characters to avoid token limits (DALL-E can handle more, but safe)
-    if len(clean_prompt) > 500:
-        clean_prompt = clean_prompt[:500] + "..."
-    
-    # Better instruction: recreate the described image without watermarks
-    final_prompt = f"Recreate this image exactly as described, without any watermarks or logos: {clean_prompt}"
+    # Keep the description intact – do NOT modify it except for length limit
+    if len(prompt) > 2000:
+        prompt = prompt[:2000] + "..."
+
+    # DIRECT, NO-FLUFF PROMPT for DALL-E
+    final_prompt = f"Reproduce exactly this image: {prompt}"
 
     try:
-        print(f"🎨 Trying GPT Image 2 with prompt: {final_prompt[:100]}...")
-        
-        # CRITICAL: No 'quality' or 'response_format' parameters
+        print(f"🎨 DALL-E prompt length: {len(final_prompt)} chars")
+        # Log the actual prompt for debugging
+        print(f"📝 DALL-E PROMPT:\n{final_prompt[:500]}...")
         response = openai_client.images.generate(
             model="gpt-image-2",
             prompt=final_prompt,
             size="1024x1024",
             n=1
         )
-        
-        print(f"📦 Response received successfully")
-        if hasattr(response, '_request_id'):
-            print(f"🔑 Request ID: {response._request_id}")
-
         if response.data and len(response.data) > 0:
             img_data = response.data[0]
             if img_data.b64_json:
                 image_bytes = base64.b64decode(img_data.b64_json)
-                input_file = BufferedInputFile(file=image_bytes, filename="generated.png")
-                print("✅ Generated image from base64")
-                return input_file
+                return BufferedInputFile(file=image_bytes, filename="generated.png")
             elif img_data.url:
-                print(f"✅ Generated image URL: {img_data.url}")
                 return img_data.url
-        print("❌ No image data in response.")
         return None
-        
     except Exception as e:
-        print(f"❌ OpenAI GPT Image 2 error: {e}")
+        print(f"❌ DALL-E error: {e}")
         if hasattr(e, 'response'):
-            print(f"📄 Response body: {e.response.text}")
-        if hasattr(e, 'status_code'):
-            print(f"📊 Status code: {e.status_code}")
-        if hasattr(e, 'request_id'):
-            print(f"🔑 Request ID: {e.request_id}")
-        
-        # Fallback: only try generic if the custom prompt fails with a specific error
-        # But if it's a content policy violation, generic might also fail.
-        # So we'll only fallback if the error is not a content policy.
-        error_str = str(e).lower()
-        if "content_policy" not in error_str and "moderation" not in error_str:
+            print(f"📄 Response: {e.response.text}")
+        # Only fallback on non-content errors
+        if "content_policy" not in str(e).lower() and "moderation" not in str(e).lower():
             try:
-                print("🔄 Trying fallback with generic prompt...")
-                response = openai_client.images.generate(
+                print("🔄 Trying generic fallback...")
+                resp = openai_client.images.generate(
                     model="gpt-image-2",
-                    prompt="A sports betting graphic with teams and odds, clean modern style",
+                    prompt="Sports betting graphic with teams and odds, clean modern layout",
                     size="1024x1024",
                     n=1
                 )
-                if response.data and len(response.data) > 0:
-                    img_data = response.data[0]
-                    if img_data.b64_json:
-                        image_bytes = base64.b64decode(img_data.b64_json)
-                        print("✅ Fallback succeeded")
-                        return BufferedInputFile(file=image_bytes, filename="fallback.png")
+                if resp.data and resp.data[0].b64_json:
+                    return BufferedInputFile(file=base64.b64decode(resp.data[0].b64_json), filename="fallback.png")
             except Exception as e2:
-                print(f"❌ Fallback also failed: {e2}")
-        else:
-            print("❌ Content policy violation – cannot generate.")
-        
+                print(f"❌ Fallback failed: {e2}")
         return None
 
 async def regenerate_image_from_bytes(image_bytes: bytes):
