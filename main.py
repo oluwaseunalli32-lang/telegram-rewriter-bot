@@ -3,9 +3,24 @@ import asyncio
 import logging
 from pathlib import Path
 
+# ============================================================
+# LOAD ENVIRONMENT FIRST
+# ============================================================
+# IMPORTANT:
+# ai_processor.py reads environment variables when it is imported.
+# Therefore .env MUST be loaded before importing ai_processor.
+
 from dotenv import load_dotenv
+
+env_path = Path(__file__).parent / ".env"
+load_dotenv(dotenv_path=env_path)
+
+
+# ============================================================
+# IMPORTS
+# ============================================================
+
 from aiogram import Bot
-from aiogram.types import BufferedInputFile
 from telethon import TelegramClient, errors
 
 import database
@@ -13,7 +28,7 @@ from ai_processor import rewrite_text, regenerate_image_from_bytes
 
 
 # ============================================================
-# CONFIG
+# LOGGING
 # ============================================================
 
 logging.basicConfig(
@@ -23,38 +38,54 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-env_path = Path(__file__).parent / ".env"
-load_dotenv(dotenv_path=env_path)
+
+# ============================================================
+# ENVIRONMENT VARIABLES
+# ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID = int(os.getenv("API_ID")) if os.getenv("API_ID") else 0
 API_HASH = os.getenv("API_HASH")
 PHONE = os.getenv("PHONE_NUMBER")
 
+
 if not BOT_TOKEN or not API_ID or not API_HASH or not PHONE:
-    logger.error("Missing environment variables! Check .env file.")
+    logger.error("Missing environment variables! Check your .env file.")
     raise SystemExit(1)
 
+
+# ============================================================
+# TELEGRAM CLIENTS
+# ============================================================
+
 bot = Bot(token=BOT_TOKEN)
+
 user_client = TelegramClient(
     "session_name",
     API_ID,
     API_HASH,
 )
 
+
+# ============================================================
+# CHANNEL CONFIGURATION
+# ============================================================
+
 SOURCE_CHANNEL_ID = -1003593544389
 TARGET_CHANNEL_ID = -1004415621706
 
-# IMPORTANT:
-# Text messages are NOT converted into generated images anymore.
-# Only actual image messages go through Vision + image generation.
-ENABLE_IMAGE_FOR_TEXT = False
 
-# Prevent the same message from being processed twice by one process.
+# ============================================================
+# PROCESSING STATE
+# ============================================================
+
+# Prevent the same message from being processed twice
+# during the lifetime of this process.
 processing_ids = set()
+
 processing_lock = asyncio.Lock()
 
-# Last processed message per source.
+# Last processed message per source channel.
 last_processed = {}
 
 
@@ -63,27 +94,27 @@ last_processed = {}
 # ============================================================
 
 async def ensure_connection():
-    if not user_client.is_connected():
-        logger.warning(
-            "⚠️ Client disconnected! Attempting to reconnect..."
-        )
+    """
+    Make sure the Telethon client is connected.
+    """
 
-        try:
-            await user_client.connect()
+    if user_client.is_connected():
+        return True
 
-            if not user_client.is_connected():
-                await user_client.start(phone=PHONE)
+    logger.warning("⚠️ Client disconnected! Attempting to reconnect...")
 
-            logger.info("✅ Reconnected successfully!")
-            return True
+    try:
+        await user_client.connect()
 
-        except Exception as e:
-            logger.error(
-                f"❌ Reconnection failed: {e}"
-            )
-            return False
+        if not user_client.is_connected():
+            await user_client.start(phone=PHONE)
 
-    return True
+        logger.info("✅ Reconnected successfully!")
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ Reconnection failed: {e}")
+        return False
 
 
 # ============================================================
@@ -92,17 +123,20 @@ async def ensure_connection():
 
 def get_image_media(msg):
     """
-    Return the actual Telegram image/document media if this message
-    contains an image.
+    Return Telegram media if the message contains an image.
 
-    This deliberately does NOT treat ordinary text as an image.
+    Supports:
+    - Telegram photos
+    - GIFs
+    - animated GIFs sent as documents
+    - image documents
     """
 
-    # Standard Telegram photo.
+    # Standard Telegram photo
     if getattr(msg, "photo", None):
         return msg.photo
 
-    # Telegram images/GIFs sent as documents.
+    # Telegram GIFs/images are commonly documents.
     document = getattr(msg, "document", None)
 
     if document:
@@ -111,7 +145,13 @@ def get_image_media(msg):
         if mime_type.startswith("image/"):
             return document
 
-    # Extra Telethon fallback.
+        # Some Telegram GIFs can be reported differently.
+        file_name = getattr(document, "attributes", None)
+
+        if file_name:
+            return document
+
+    # Extra Telethon fallback
     media = getattr(msg, "media", None)
 
     if media and hasattr(media, "photo"):
@@ -131,23 +171,26 @@ async def process_single_media(
     message_id,
 ):
     """
-    Download the ORIGINAL image, send it through:
+    Download the original image/GIF and send it through:
 
-        ORIGINAL IMAGE
-            ↓
-        OpenAI Vision deconstruction
-            ↓
+        ORIGINAL IMAGE/GIF
+              ↓
+        OpenAI Vision
+              ↓
+        Visual deconstruction
+              ↓
         OpenAI image generation
-            ↓
+              ↓
         NEW IMAGE
+              ↓
+        Telegram target
 
-    We intentionally do NOT fall back to posting the original
-    watermarked image if regeneration fails.
+    The original image is NEVER reposted if generation fails.
     """
 
     try:
         logger.info(
-            f"🖼️ [{message_id}] Downloading original image..."
+            f"🖼️ [{message_id}] Downloading original image/GIF..."
         )
 
         image_bytes = await user_client.download_media(
@@ -167,7 +210,7 @@ async def process_single_media(
         )
 
         logger.info(
-            f"🔍 [{message_id}] Sending ORIGINAL image "
+            f"🔍 [{message_id}] Sending original media "
             f"to OpenAI Vision..."
         )
 
@@ -183,20 +226,17 @@ async def process_single_media(
             return False
 
         logger.info(
-            f"📤 [{message_id}] Sending NEW regenerated image "
-            f"to target channel..."
+            f"📤 [{message_id}] Sending NEW regenerated image..."
         )
 
         await bot.send_photo(
             chat_id=target_id,
             photo=new_image_data,
-            caption=caption_text[:1024]
-            if caption_text
-            else None,
+            caption=caption_text[:1024] if caption_text else None,
         )
 
         logger.info(
-            f"✅ [{message_id}] Posted NEW regenerated image"
+            f"✅ [{message_id}] NEW regenerated image posted."
         )
 
         return True
@@ -213,9 +253,13 @@ async def process_single_media(
 # ============================================================
 
 async def process_channel(source_id, target_id):
+    """
+    Process new messages from one source channel.
+    """
+
     if not await ensure_connection():
         logger.error(
-            "❌ Cannot process: Client is disconnected."
+            "❌ Cannot process channel: client is disconnected."
         )
         return
 
@@ -227,7 +271,10 @@ async def process_channel(source_id, target_id):
             0,
         )
 
-        # Fetch messages newer than last_id in chronological order.
+        # --------------------------------------------------------
+        # Fetch new messages in chronological order.
+        # --------------------------------------------------------
+
         new_messages = []
 
         async for msg in user_client.iter_messages(
@@ -240,10 +287,14 @@ async def process_channel(source_id, target_id):
         if not new_messages:
             return
 
+        # --------------------------------------------------------
+        # Process each message.
+        # --------------------------------------------------------
+
         for msg in new_messages:
 
-            # Per-process duplicate protection.
             async with processing_lock:
+
                 if msg.id in processing_ids:
                     logger.warning(
                         f"⚠️ Message {msg.id} is already being processed. "
@@ -254,12 +305,18 @@ async def process_channel(source_id, target_id):
                 processing_ids.add(msg.id)
 
             try:
+
                 logger.info(
                     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
                 )
+
                 logger.info(
                     f"📩 Processing message ID: {msg.id}"
                 )
+
+                # ------------------------------------------------
+                # Extract caption/text.
+                # ------------------------------------------------
 
                 original_text = (
                     getattr(msg, "text", None)
@@ -268,8 +325,14 @@ async def process_channel(source_id, target_id):
                     or ""
                 )
 
-                # ONLY replace @cappersfree -> NEW_MENTION.
-                # No DeepSeek rewriting.
+                # ------------------------------------------------
+                # ONLY replace username.
+                #
+                # No DeepSeek.
+                # No AI rewriting.
+                # No paraphrasing.
+                # ------------------------------------------------
+
                 rewritten_text = await rewrite_text(
                     original_text
                 )
@@ -283,20 +346,56 @@ async def process_channel(source_id, target_id):
                         f"✏️ [{msg.id}] No username replacement needed."
                     )
 
+                # ------------------------------------------------
+                # Detect image/GIF.
+                # ------------------------------------------------
+
                 media = get_image_media(msg)
 
                 if media:
 
                     logger.info(
-                        f"🖼️ [{msg.id}] IMAGE DETECTED"
+                        f"🖼️ [{msg.id}] IMAGE/GIF DETECTED"
                     )
+
                     logger.info(
-                        f"🛑 [{msg.id}] This message will NOT use "
-                        f"text-to-image."
+                        f"🔍 [{msg.id}] Starting:"
                     )
+
                     logger.info(
-                        f"🔍 [{msg.id}] Starting Vision → "
-                        f"Deconstruction → Regeneration."
+                        "    ORIGINAL"
+                    )
+
+                    logger.info(
+                        "       ↓"
+                    )
+
+                    logger.info(
+                        "    OPENAI VISION"
+                    )
+
+                    logger.info(
+                        "       ↓"
+                    )
+
+                    logger.info(
+                        "    DECONSTRUCTION"
+                    )
+
+                    logger.info(
+                        "       ↓"
+                    )
+
+                    logger.info(
+                        "    IMAGE GENERATION"
+                    )
+
+                    logger.info(
+                        "       ↓"
+                    )
+
+                    logger.info(
+                        "    NEW IMAGE"
                     )
 
                     success = await process_single_media(
@@ -308,23 +407,22 @@ async def process_channel(source_id, target_id):
 
                     if not success:
                         logger.error(
-                            f"❌ [{msg.id}] Image was not posted "
+                            f"❌ [{msg.id}] Image was NOT posted "
                             f"because regeneration failed."
                         )
 
                 else:
 
-                    # TEXT-ONLY MESSAGE:
-                    # Just replace username and post the text.
+                    # ------------------------------------------------
+                    # TEXT ONLY MESSAGE
+                    # ------------------------------------------------
+
                     logger.info(
                         f"📝 [{msg.id}] TEXT-ONLY MESSAGE"
                     )
-                    logger.info(
-                        f"🛑 [{msg.id}] No image detected. "
-                        f"Skipping image generation."
-                    )
 
                     if rewritten_text:
+
                         await bot.send_message(
                             chat_id=target_id,
                             text=rewritten_text,
@@ -334,9 +432,10 @@ async def process_channel(source_id, target_id):
                             f"📝 [{msg.id}] Posted text-only message."
                         )
 
-                # Mark this individual message as successfully handled
-                # after processing, rather than advancing past all
-                # messages before processing them.
+                # ------------------------------------------------
+                # Mark message as handled.
+                # ------------------------------------------------
+
                 last_processed[source_id] = max(
                     last_processed.get(source_id, 0),
                     msg.id,
@@ -346,28 +445,37 @@ async def process_channel(source_id, target_id):
                     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
                 )
 
+                # Small delay between messages.
                 await asyncio.sleep(8)
 
             finally:
+
                 async with processing_lock:
                     processing_ids.discard(msg.id)
 
     except errors.rpcerrorlist.AuthKeyError as e:
+
         logger.error(
             f"Authentication error: {e}. Restarting..."
         )
 
         try:
-            await user_client.start(phone=PHONE)
+            await user_client.start(
+                phone=PHONE
+            )
+
         except Exception as restart_error:
+
             logger.error(
                 f"❌ Could not restart Telegram client: "
                 f"{restart_error}"
             )
 
     except Exception as e:
+
         logger.exception(
-            f"❌ Error processing {source_id}: {e}"
+            f"❌ Error processing channel "
+            f"{source_id}: {e}"
         )
 
 
@@ -376,6 +484,7 @@ async def process_channel(source_id, target_id):
 # ============================================================
 
 async def poll_channels():
+
     while True:
 
         if not await ensure_connection():
@@ -389,6 +498,7 @@ async def poll_channels():
             continue
 
         for client in clients:
+
             await process_channel(
                 client["source"],
                 client["target"],
@@ -404,9 +514,20 @@ async def poll_channels():
 async def main():
 
     logger.info(
-        "Starting Telegram Rewriter Bot "
-        "(Vision Deconstruction + Image Regeneration)..."
+        "🚀 Starting Telegram Image Recreation Bot..."
     )
+
+    logger.info(
+        "   Caption handling: EXACT username replacement"
+    )
+
+    logger.info(
+        "   Image handling: Vision → Deconstruction → Generation"
+    )
+
+    # --------------------------------------------------------
+    # Start Telegram user client.
+    # --------------------------------------------------------
 
     await user_client.start(
         phone=PHONE,
@@ -418,14 +539,20 @@ async def main():
         await user_client.connect()
 
         if not user_client.is_connected():
+
             logger.error(
                 "❌ Failed to connect on startup!"
             )
+
             return
 
     logger.info(
         "✅ User client connected!"
     )
+
+    # --------------------------------------------------------
+    # Register source → target.
+    # --------------------------------------------------------
 
     existing = database.get_target_for_source(
         SOURCE_CHANNEL_ID
@@ -450,8 +577,13 @@ async def main():
             f"{SOURCE_CHANNEL_ID} → {existing}"
         )
 
-    # Start from the current newest message so old posts are not
-    # regenerated when the bot first starts.
+    # --------------------------------------------------------
+    # Start from newest message.
+    #
+    # This prevents the bot from regenerating every old post
+    # when it starts for the first time.
+    # --------------------------------------------------------
+
     for client in database.get_all_clients():
 
         source = client["source"]
@@ -481,12 +613,20 @@ async def main():
                 f"from {source}: {e}"
             )
 
+    # --------------------------------------------------------
+    # Start polling.
+    # --------------------------------------------------------
+
     logger.info(
         "🚀 Starting polling loop..."
     )
 
     await poll_channels()
 
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
     asyncio.run(main())
