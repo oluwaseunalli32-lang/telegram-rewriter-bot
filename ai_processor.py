@@ -3,8 +3,9 @@ import re
 import base64
 import time
 import asyncio
+import json
 from io import BytesIO
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from openai import OpenAI
 from aiogram.types import BufferedInputFile
 
@@ -84,27 +85,27 @@ async def describe_image_bytes(image_bytes: bytes) -> str:
         if img.mode != 'RGB':
             img = img.convert('RGB')
         buffered = BytesIO()
-        img.save(buffered, format="JPEG", quality=85)
+        img.save(buffered, format="JPEG", quality=90)
         img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
         data_url = f"data:image/jpeg;base64,{img_base64}"
 
-        # ULTRA‑DETAILED VISION PROMPT – captures everything except watermarks
+        # EXTREME DETAIL – this is the key to accurate reconstruction
         vision_prompt = """
-        You are a forensic image describer. Describe the image with absolute precision.
-        You MUST include:
+        You are an expert image describer. Describe the image with extreme precision as if you are creating a technical blueprint for a graphic designer.
 
-        - **All visible text**: exact wording, numbers, odds, team names, league names, scores, stake amounts, dates, times, and any other labels.
-        - **The exact position of each text element** (e.g., "top-left", "center", "bottom-right", or "x%, y%").
-        - **Colors**: background color, text colors, border colors (use hex codes if possible).
-        - **Font styles**: bold, italic, size (if discernible), font family (if known).
-        - **Layout**: boxes, borders, shading, gradients, rounded corners, shadows.
-        - **Decorative elements**: lines, icons, logos (describe them but note they are watermarks to ignore).
-        - **Overall style**: modern, classic, dark/light mode, etc.
+        Follow this structure:
+        1. **Overall layout**: background color (hex), size, any borders or shadows.
+        2. **Text elements**: For each piece of text, list:
+           - The exact text (wording, numbers, symbols)
+           - Position (e.g., "top-left corner", "center", "x=20%, y=80%")
+           - Font size (if discernible) and style (bold, italic, color in hex)
+           - Any background box behind the text (color, border)
+        3. **Graphics/Logos**: Describe any icons, lines, or shapes (ignore watermarks like @cappersfree or CF).
+        4. **Colors**: Provide hex codes for all major color blocks.
 
-        IMPORTANT: IGNORE and do NOT mention any usernames (like @cappersfree), channel names, or 'CF' logos.
-        These are watermarks and should be excluded from the description.
+        IMPORTANT: Omit any usernames (like @cappersfree) and logos (like CF) – these are watermarks you should skip.
 
-        Output the description in plain English, but make it so detailed that an artist could paint a perfect replica without ever seeing the original.
+        Output the description as plain English but make it exhaustive. The goal is to recreate the image exactly.
         """
 
         max_retries = 4
@@ -112,7 +113,7 @@ async def describe_image_bytes(image_bytes: bytes) -> str:
         for attempt in range(max_retries):
             try:
                 response = openai_client.chat.completions.create(
-                    model="gpt-4o-mini",
+                    model="gpt-4o",  # stronger model for better accuracy
                     messages=[
                         {
                             "role": "user",
@@ -122,11 +123,10 @@ async def describe_image_bytes(image_bytes: bytes) -> str:
                             ]
                         }
                     ],
-                    max_tokens=1200  # enough for a very detailed description
+                    max_tokens=1500
                 )
                 description = response.choices[0].message.content.strip()
                 print(f"✅ Vision description (first 300 chars): {description[:300]}...")
-                # Log the FULL description so you can verify it
                 print(f"📝 FULL VISION DESCRIPTION:\n{description}")
                 return description
             except Exception as e:
@@ -144,7 +144,7 @@ async def describe_image_bytes(image_bytes: bytes) -> str:
 
 async def generate_image_from_description(prompt: str):
     global _last_generation_call
-    if not prompt or len(prompt) < 10:
+    if not prompt or len(prompt) < 20:
         return None
 
     now = time.time()
@@ -155,16 +155,25 @@ async def generate_image_from_description(prompt: str):
         await asyncio.sleep(wait)
     _last_generation_call = time.time()
 
-    # Use the full description – do NOT shorten (max 2500 chars for safety)
-    if len(prompt) > 2500:
-        prompt = prompt[:2500] + "..."
+    # Keep the description intact, but cap length for DALL-E (it handles ~4000 chars)
+    if len(prompt) > 3500:
+        prompt = prompt[:3500] + "..."
 
-    final_prompt = f"Recreate the image described below with the exact same layout, colors, font styles, and all text content. Do NOT include any watermarks, usernames, or social media handles. Remove any branding like 'CF' or 'Cappers Free'. Keep all other text, numbers, odds, team names, scores, and stake amounts exactly as described. Preserve the background color, borders, boxes, and decorative elements. The output should look almost identical to the original, just without the watermarks.\n\nDescription:\n{prompt}"
+    final_prompt = f"""
+    Reproduce the image exactly as described below.
+    - Use the exact same layout, colors, font styles, and text positions.
+    - Include all text content, numbers, team names, odds, scores.
+    - Do NOT include any watermarks, usernames (like @cappersfree), or logos (like CF).
+    - The background, borders, and decorative elements must match the description.
+
+    Description:
+    {prompt}
+    """
 
     try:
         print(f"🎨 DALL-E prompt length: {len(final_prompt)} chars")
-        # Log the full prompt for debugging
-        print(f"📝 DALL-E FULL PROMPT:\n{final_prompt[:500]}...")
+        # Log first 500 chars for debugging
+        print(f"📝 DALL-E PROMPT (first 500 chars):\n{final_prompt[:500]}...")
         response = openai_client.images.generate(
             model="gpt-image-2",
             prompt=final_prompt,
@@ -175,7 +184,7 @@ async def generate_image_from_description(prompt: str):
             img_data = response.data[0]
             if img_data.b64_json:
                 image_bytes = base64.b64decode(img_data.b64_json)
-                return BufferedInputFile(file=image_bytes, filename="generated.png")
+                return BufferedInputFile(file=image_bytes, filename="reconstructed.png")
             elif img_data.url:
                 return img_data.url
         return None
@@ -183,6 +192,21 @@ async def generate_image_from_description(prompt: str):
         print(f"❌ DALL-E error: {e}")
         if hasattr(e, 'response'):
             print(f"📄 Response: {e.response.text}")
+        # Fallback to a simpler prompt if content policy is triggered
+        if "content_policy" in str(e).lower() or "moderation" in str(e).lower():
+            try:
+                print("🔄 Content policy – trying simplified prompt...")
+                fallback_prompt = f"Recreate this image without watermarks: {prompt[:200]}"
+                response = openai_client.images.generate(
+                    model="gpt-image-2",
+                    prompt=fallback_prompt,
+                    size="1024x1024",
+                    n=1
+                )
+                if response.data and response.data[0].b64_json:
+                    return BufferedInputFile(file=base64.b64decode(response.data[0].b64_json), filename="fallback.png")
+            except Exception as e2:
+                print(f"❌ Fallback failed: {e2}")
         return None
 
 async def regenerate_image_from_bytes(image_bytes: bytes):
