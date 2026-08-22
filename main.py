@@ -47,11 +47,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID = int(os.getenv("API_ID")) if os.getenv("API_ID") else 0
 API_HASH = os.getenv("API_HASH")
 PHONE = os.getenv("PHONE_NUMBER")
-NEW_MENTION = os.getenv("NEW_MENTION", "").strip()
-
-
-if NEW_MENTION and not NEW_MENTION.startswith("@"):
-    NEW_MENTION = "@" + NEW_MENTION
 
 
 if not BOT_TOKEN or not API_ID or not API_HASH or not PHONE:
@@ -128,35 +123,51 @@ async def ensure_connection():
 
 def get_image_media(msg):
     """
-    Return Telegram media if the message contains an image.
+    Return Telegram media that can be processed as an image.
 
-    Supports:
-    - Telegram photos
-    - GIFs
-    - animated GIFs sent as documents
-    - image documents
+    Telegram GIFs are commonly delivered as MP4 video documents,
+    so video/* is intentionally accepted and converted to frames
+    by ai_processor.py.
     """
-
-    # Standard Telegram photo
     if getattr(msg, "photo", None):
         return msg.photo
 
-    # Telegram GIFs/images are commonly documents.
     document = getattr(msg, "document", None)
 
     if document:
-        mime_type = getattr(document, "mime_type", "") or ""
+        mime_type = (
+            getattr(document, "mime_type", "") or ""
+        ).lower()
 
         if mime_type.startswith("image/"):
             return document
 
-        # Some Telegram GIFs can be reported differently.
-        file_name = getattr(document, "attributes", None)
-
-        if file_name:
+        # Telegram GIFs are often MP4.
+        if mime_type.startswith("video/"):
             return document
 
-    # Extra Telethon fallback
+        attributes = getattr(
+            document,
+            "attributes",
+            None,
+        ) or []
+
+        for attribute in attributes:
+            file_name = getattr(
+                attribute,
+                "file_name",
+                "",
+            ) or ""
+
+            extension = Path(file_name).suffix.lower()
+
+            if extension in {
+                ".jpg", ".jpeg", ".png", ".webp",
+                ".gif", ".bmp", ".tif", ".tiff",
+                ".mp4", ".mov", ".webm",
+            }:
+                return document
+
     media = getattr(msg, "media", None)
 
     if media and hasattr(media, "photo"):
@@ -214,19 +225,22 @@ async def process_single_media(
             f"{len(image_bytes)} bytes"
         )
 
-        logger.info(
-            f"🔍 [{message_id}] Calling image regeneration pipeline..."
-        )
-
         try:
-            new_image_data = await regenerate_image_from_bytes(
-                image_bytes
+            logger.info(
+                f"🔬 [{message_id}] Media header: "
+                f"{bytes(image_bytes[:16]).hex(' ')}"
             )
         except Exception:
-            logger.exception(
-                f"❌ [{message_id}] UNHANDLED REGENERATION EXCEPTION"
-            )
-            return False
+            pass
+
+        logger.info(
+            f"🔍 [{message_id}] Sending original media "
+            f"to OpenAI Vision..."
+        )
+
+        new_image_data = await regenerate_image_from_bytes(
+            image_bytes
+        )
 
         if not new_image_data:
             logger.error(
@@ -528,12 +542,7 @@ async def main():
     )
 
     logger.info(
-        "   Caption handling: remove '*' + exact username replacement"
-    )
-
-    logger.info(
-        "   NEW_MENTION: %r",
-        NEW_MENTION,
+        "   Caption handling: EXACT username replacement"
     )
 
     logger.info(
