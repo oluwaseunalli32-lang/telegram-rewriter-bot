@@ -5,221 +5,319 @@ import time
 import asyncio
 from io import BytesIO
 
-from PIL import Image, ImageSequence
+from PIL import Image
 from openai import OpenAI
 from aiogram.types import BufferedInputFile
 
 
 # ============================================================
-# API CLIENT
+# OPENAI
 # ============================================================
 
-# We deliberately do NOT use DeepSeek for username replacement.
-#
-# Username replacement must be deterministic:
-#
-#     @cappersfree
-#          ↓
-#     @YOUR_USERNAME
-#
-# An LLM should not be trusted to preserve odds, numbers,
-# punctuation, team names, etc.
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+
+if not OPENAI_API_KEY:
+    print("⚠️ OPENAI_API_KEY is missing!")
 
 openai_client = OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY")
+    api_key=OPENAI_API_KEY
 )
 
 
 # ============================================================
-# CONFIG
+# CAPTION CONFIGURATION
 # ============================================================
 
-NEW_MENTION = os.getenv(
-    "NEW_MENTION",
-    "",
-).strip()
+# This comes from Render:
+#
+# NEW_MENTION=@PrimeAnalysiss
+#
+# You do NOT need to put @PrimeAnalysiss inside this file.
 
 OLD_MENTION = os.getenv(
     "OLD_MENTION",
     "@cappersfree",
 ).strip()
 
+NEW_MENTION = os.getenv(
+    "NEW_MENTION",
+    "",
+).strip()
+
+
+# Make sure the new username has @
+if NEW_MENTION and not NEW_MENTION.startswith("@"):
+    NEW_MENTION = "@" + NEW_MENTION
+
 
 # ============================================================
-# RATE LIMIT / COOLDOWN
+# OPENAI COOLDOWNS
 # ============================================================
 
 _last_vision_call = 0.0
-_vision_cooldown = 8
+_vision_cooldown = 3
 
 _last_generation_call = 0.0
-_generation_cooldown = 8
+_generation_cooldown = 3
 
 
 # ============================================================
-# TEXT PROCESSING
+# STARTUP CONFIG LOG
+# ============================================================
+
+print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+print("🤖 AI PROCESSOR STARTED")
+print("👤 OLD_MENTION:", repr(OLD_MENTION))
+print("👤 NEW_MENTION:", repr(NEW_MENTION))
+print(
+    "🧠 Caption AI rewriting: DISABLED"
+)
+print(
+    "✏️ Caption processing: EXACT REPLACEMENT"
+)
+print(
+    "🖼️ Image pipeline: VISION → DECONSTRUCTION → GENERATION"
+)
+print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+
+# ============================================================
+# CAPTION PROCESSING
 # ============================================================
 
 def replace_username(text: str) -> str:
     """
-    Replace ONLY the configured old username.
+    Process the Telegram caption.
 
-    Nothing else is changed.
+    ONLY does two things:
 
-    Example:
+    1. Remove every literal '*'
+    2. Replace @cappersfree with NEW_MENTION
 
-        @cappersfree
-              ↓
-        @myusername
-
-    The function does NOT:
-    - paraphrase
-    - rewrite
-    - summarize
-    - change odds
-    - change numbers
-    - change team names
-    - change punctuation
-    - change other mentions
+    Nothing is paraphrased or rewritten by AI.
     """
 
     if not text:
         return text
 
-    if not NEW_MENTION:
-        return text
+    result = text
 
-    if not OLD_MENTION:
-        return text
+    # --------------------------------------------------------
+    # Remove Markdown asterisks.
+    #
+    # Example:
+    #
+    # **SBK**
+    #
+    # becomes:
+    #
+    # SBK
+    # --------------------------------------------------------
 
-    return re.sub(
-        re.escape(OLD_MENTION),
-        NEW_MENTION,
-        text,
-        flags=re.IGNORECASE,
-    )
+    result = result.replace("*", "")
+
+    # --------------------------------------------------------
+    # Replace old username.
+    #
+    # We do this AFTER removing '*', so these all work:
+    #
+    # @cappersfree
+    # @**cappersfree
+    # @***cappersfree
+    # --------------------------------------------------------
+
+    if NEW_MENTION:
+
+        pattern = re.escape(
+            OLD_MENTION
+        )
+
+        result = re.sub(
+            pattern,
+            NEW_MENTION,
+            result,
+            flags=re.IGNORECASE,
+        )
+
+    else:
+
+        print(
+            "⚠️ NEW_MENTION is empty. "
+            "Username was not replaced."
+        )
+
+    return result
 
 
-async def rewrite_text(original_text: str) -> str:
+async def rewrite_text(
+    original_text: str,
+) -> str:
     """
-    Kept with the old function name so main.py can simply import it.
+    Kept with the same function name so main.py
+    does not need to change.
 
-    IMPORTANT:
+    NO DeepSeek.
+    NO OpenAI.
+    NO paraphrasing.
 
-    There is NO AI rewriting here.
-
-    This is an exact deterministic username replacement.
+    Only:
+        remove *
+        replace @cappersfree
     """
 
-    return replace_username(
+    result = replace_username(
         original_text
     )
 
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("📝 CAPTION PROCESSING")
+    print("📝 ORIGINAL:", repr(original_text))
+    print("📝 FINAL:   ", repr(result))
+    print("👤 OLD:     ", repr(OLD_MENTION))
+    print("👤 NEW:     ", repr(NEW_MENTION))
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    return result
+
 
 # ============================================================
-# GIF / IMAGE PREPARATION
+# IMAGE PREPARATION
 # ============================================================
 
-def create_vision_image(
+def resize_for_vision(
+    img: Image.Image,
+) -> Image.Image:
+    """
+    Resize image while preserving aspect ratio.
+    """
+
+    max_dimension = 2048
+
+    if max(img.size) <= max_dimension:
+        return img
+
+    scale = (
+        max_dimension
+        / max(img.size)
+    )
+
+    new_size = (
+        max(
+            1,
+            int(
+                img.width * scale
+            ),
+        ),
+        max(
+            1,
+            int(
+                img.height * scale
+            ),
+        ),
+    )
+
+    return img.resize(
+        new_size,
+        Image.Resampling.LANCZOS,
+    )
+
+
+def prepare_image_for_vision(
     image_bytes: bytes,
 ):
     """
-    Prepare an image for OpenAI Vision.
+    Prepare a Telegram image/GIF for Vision.
 
-    For normal images:
-        return the original image converted to JPEG.
+    Static image:
+        image → JPEG
 
-    For animated GIFs:
-        sample multiple frames and create a contact sheet.
-
-    This means Vision gets information about the animation
-    rather than silently seeing only frame 1.
+    Animated GIF:
+        several representative frames
+        → contact sheet
+        → JPEG
     """
 
     try:
 
-        img = Image.open(
+        source = Image.open(
             BytesIO(image_bytes)
         )
 
         is_animated = getattr(
-            img,
+            source,
             "is_animated",
             False,
         )
 
-        # --------------------------------------------------------
-        # NORMAL STATIC IMAGE
-        # --------------------------------------------------------
+        # ====================================================
+        # STATIC IMAGE
+        # ====================================================
 
         if not is_animated:
 
-            if img.mode not in (
-                "RGB",
-                "RGBA",
-            ):
-                img = img.convert("RGBA")
-
-            if img.mode == "RGBA":
-
-                background = Image.new(
-                    "RGB",
-                    img.size,
-                    "white",
-                )
-
-                background.paste(
-                    img,
-                    mask=img.getchannel("A"),
-                )
-
-                img = background
-
-            else:
-
-                img = img.convert("RGB")
-
-            return resize_for_vision(
-                img
+            image = source.convert(
+                "RGBA"
             )
 
-        # --------------------------------------------------------
-        # ANIMATED GIF
-        # --------------------------------------------------------
+            # Flatten transparency onto white.
+            background = Image.new(
+                "RGB",
+                image.size,
+                "white",
+            )
 
-        frames = []
+            background.paste(
+                image,
+                mask=image.getchannel("A"),
+            )
+
+            return resize_for_vision(
+                background
+            )
+
+        # ====================================================
+        # ANIMATED GIF
+        # ====================================================
 
         total_frames = getattr(
-            img,
+            source,
             "n_frames",
             1,
         )
 
-        # We don't need every frame.
-        # We want representative frames.
         sample_count = min(
             6,
             total_frames,
         )
 
         if sample_count <= 1:
-            indexes = [0]
+
+            frame_indexes = [0]
+
         else:
-            indexes = [
+
+            frame_indexes = [
                 round(
-                    i * (total_frames - 1)
+                    i
+                    * (total_frames - 1)
                     / (sample_count - 1)
                 )
-                for i in range(sample_count)
+                for i in range(
+                    sample_count
+                )
             ]
 
-        for index in indexes:
+        frames = []
+
+        for frame_number in frame_indexes:
 
             try:
 
-                img.seek(index)
+                source.seek(
+                    frame_number
+                )
 
-                frame = img.convert(
+                frame = source.convert(
                     "RGBA"
                 )
 
@@ -234,11 +332,8 @@ def create_vision_image(
                     mask=frame.getchannel("A"),
                 )
 
-                frame = background
-
-                frame.thumbnail(
-                    (600, 600),
-                    Image.Resampling.LANCZOS,
+                frame = resize_for_vision(
+                    background
                 )
 
                 frames.append(
@@ -248,20 +343,37 @@ def create_vision_image(
             except Exception as e:
 
                 print(
-                    f"⚠️ Could not read GIF frame "
-                    f"{index}: {e}"
+                    f"⚠️ Could not read GIF "
+                    f"frame {frame_number}: {e}"
                 )
 
         if not frames:
+
+            print(
+                "❌ No GIF frames could be extracted."
+            )
+
             return None
 
-        # --------------------------------------------------------
-        # CREATE CONTACT SHEET
-        # --------------------------------------------------------
+        print(
+            f"🎞️ GIF detected: "
+            f"{total_frames} total frames"
+        )
+
+        print(
+            f"🎞️ Using {len(frames)} representative frames"
+        )
+
+        # ====================================================
+        # CONTACT SHEET
+        # ====================================================
 
         columns = 3
+
         rows = (
-            len(frames) + columns - 1
+            len(frames)
+            + columns
+            - 1
         ) // columns
 
         cell_width = max(
@@ -277,13 +389,21 @@ def create_vision_image(
         padding = 20
 
         sheet_width = (
-            columns * cell_width
-            + (columns + 1) * padding
+            columns
+            * cell_width
+            + (
+                columns + 1
+            )
+            * padding
         )
 
         sheet_height = (
-            rows * cell_height
-            + (rows + 1) * padding
+            rows
+            * cell_height
+            + (
+                rows + 1
+            )
+            * padding
         )
 
         sheet = Image.new(
@@ -295,11 +415,16 @@ def create_vision_image(
             "white",
         )
 
-        for i, frame in enumerate(frames):
+        for index, frame in enumerate(
+            frames
+        ):
 
             x = (
                 padding
-                + (i % columns)
+                + (
+                    index
+                    % columns
+                )
                 * (
                     cell_width
                     + padding
@@ -308,7 +433,10 @@ def create_vision_image(
 
             y = (
                 padding
-                + (i // columns)
+                + (
+                    index
+                    // columns
+                )
                 * (
                     cell_height
                     + padding
@@ -317,18 +445,11 @@ def create_vision_image(
 
             sheet.paste(
                 frame,
-                (x, y),
+                (
+                    x,
+                    y,
+                ),
             )
-
-        print(
-            f"🎞️ Animated GIF detected: "
-            f"{total_frames} frames"
-        )
-
-        print(
-            f"🎞️ Sampled {len(frames)} frames "
-            f"for Vision analysis"
-        )
 
         return resize_for_vision(
             sheet
@@ -337,86 +458,55 @@ def create_vision_image(
     except Exception as e:
 
         print(
-            f"❌ Image preparation error: {e}"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
+        print(
+            "❌ IMAGE PREPARATION FAILED"
+        )
+        print(
+            "❌ Type:",
+            type(e).__name__,
+        )
+        print(
+            "❌ Error:",
+            str(e),
+        )
+        print(
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         )
 
         return None
 
 
-def resize_for_vision(
-    img: Image.Image,
-):
-    """
-    Resize an image/contact sheet to a reasonable
-    maximum size while preserving detail.
-    """
-
-    max_dimension = 2048
-
-    if max(img.size) > max_dimension:
-
-        scale = (
-            max_dimension
-            / max(img.size)
-        )
-
-        new_size = (
-            max(
-                1,
-                int(
-                    img.width * scale
-                ),
-            ),
-            max(
-                1,
-                int(
-                    img.height * scale
-                ),
-            ),
-        )
-
-        img = img.resize(
-            new_size,
-            Image.Resampling.LANCZOS,
-        )
-
-    return img
-
-
 # ============================================================
-# OPENAI VISION / DECONSTRUCTION
+# OPENAI VISION
 # ============================================================
 
 async def describe_image_bytes(
     image_bytes: bytes,
 ):
     """
-    Send the original image/GIF to OpenAI Vision.
-
-    For GIFs, multiple representative frames are supplied
-    as a contact sheet.
-
-    Vision produces a detailed reconstruction specification.
-
-    Pipeline:
-
-        ORIGINAL
-            ↓
-        VISION
-            ↓
-        RECONSTRUCTION SPEC
+    Send the image/contact sheet to OpenAI Vision
+    and receive a detailed reconstruction specification.
     """
 
     global _last_vision_call
 
-    # --------------------------------------------------------
-    # Cooldown
-    # --------------------------------------------------------
+    if not image_bytes:
 
-    now = time.time()
+        print(
+            "❌ Vision received empty image bytes."
+        )
+
+        return None
+
+    # ========================================================
+    # COOLDOWN
+    # ========================================================
 
     elapsed = (
-        now - _last_vision_call
+        time.time()
+        - _last_vision_call
     )
 
     if elapsed < _vision_cooldown:
@@ -426,240 +516,255 @@ async def describe_image_bytes(
             - elapsed
         )
 
-        print(
-            f"⏳ Waiting {wait:.1f}s "
-            f"before next Vision call..."
-        )
-
         await asyncio.sleep(
             wait
         )
 
     _last_vision_call = time.time()
 
-    # --------------------------------------------------------
-    # Prepare image
-    # --------------------------------------------------------
+    # ========================================================
+    # PREPARE IMAGE
+    # ========================================================
 
-    img = create_vision_image(
-        image_bytes
-    )
+    try:
 
-    if img is None:
+        image = prepare_image_for_vision(
+            image_bytes
+        )
+
+        if image is None:
+
+            return None
+
+        buffer = BytesIO()
+
+        image.save(
+            buffer,
+            format="JPEG",
+            quality=92,
+        )
+
+        encoded = base64.b64encode(
+            buffer.getvalue()
+        ).decode(
+            "utf-8"
+        )
+
+        image_url = (
+            "data:image/jpeg;base64,"
+            + encoded
+        )
+
+    except Exception as e:
 
         print(
-            "❌ Could not prepare image "
-            "for Vision."
+            "❌ Failed to prepare Vision image:"
+        )
+
+        print(
+            type(e).__name__,
+            str(e),
         )
 
         return None
-
-    buffered = BytesIO()
-
-    img.save(
-        buffered,
-        format="JPEG",
-        quality=95,
-    )
-
-    img_base64 = base64.b64encode(
-        buffered.getvalue()
-    ).decode(
-        "utf-8"
-    )
-
-    data_url = (
-        "data:image/jpeg;base64,"
-        + img_base64
-    )
 
     # ========================================================
     # VISION PROMPT
     # ========================================================
 
-    vision_prompt = """
-You are the visual analyst in an image recreation pipeline.
+    prompt = """
+Analyze this image carefully and create a detailed
+reconstruction specification for a NEW image.
 
-Your task is to carefully DECONSTRUCT the supplied image so
-another image-generation model can create a NEW image with
-the same general visual design and information structure.
-
-The supplied image may be:
-- a normal image
-- an animated GIF represented by several sampled frames
-
-If several frames are shown, analyze them collectively and
-identify the visual elements that remain consistent as well
-as any meaningful changes between frames.
+The purpose is to understand the visual design and legitimate
+content so another image-generation model can create a new
+similar graphic.
 
 IMPORTANT:
 
-The final generated image must be a NEW independently
-generated image.
+Do NOT reproduce:
+- watermarks
+- usernames
+- @handles
+- social-media handles
+- channel branding
+- third-party logos
+- third-party brand marks
 
-Do not reproduce watermarks, usernames, social-media handles,
-channel branding, logos, or other third-party branding.
+Describe those areas generically instead.
 
-Treat those elements as excluded visual elements.
-
-Do NOT include the actual watermark, username, handle, logo,
-or channel name in the reconstruction specification.
-
-Instead, describe that area generically, for example:
-"clean background area where branding appeared."
+Do NOT include the actual watermark or username in your
+reconstruction specification.
 
 ============================================================
-ANALYZE THE IMAGE
-============================================================
-
 1. CANVAS
+============================================================
+
+Describe:
 - orientation
-- aspect ratio
-- approximate dimensions
+- approximate aspect ratio
+- layout dimensions
 - overall proportions
 
-2. MAIN SUBJECT / CONTENT
+============================================================
+2. MAIN CONTENT
+============================================================
+
 Describe all legitimate visible content:
+
 - people
-- players
+- athletes
 - teams
-- objects
 - sports
+- objects
 - equipment
+- backgrounds
 - locations
-- scenes
-- graphics
 - cards
 - panels
 - icons
-- symbols
+- graphics
 
-3. TEXT CONTENT
-Record legitimate visible text as accurately as possible.
+============================================================
+3. LEGITIMATE TEXT
+============================================================
+
+Transcribe visible legitimate text accurately.
 
 Include:
 - headings
-- labels
-- matchup information
+- matchups
 - scores
 - odds
+- picks
 - dates
 - times
-- picks
+- labels
 - numbers
-- meaningful captions
 
-Do NOT include usernames, social-media handles,
-watermarks, channel names, logos, or branding.
+Do NOT include:
+- usernames
+- @handles
+- watermarks
+- channel names
+- branding
 
-Do not invent information that is not visible.
+Never invent text that is not visible.
 
+============================================================
 4. COMPOSITION
-Describe:
-- exact placement of major elements
-- top / middle / bottom structure
-- left / center / right alignment
-- margins
-- spacing
-- hierarchy
-- cards
-- panels
-- dividers
-- borders
-- frames
-- arrows
-- icons
-- decorative elements
+============================================================
 
-5. TYPOGRAPHY
 Describe:
-- font style
-- approximate font family
-- font weight
-- uppercase/lowercase
-- relative font sizes
+- top section
+- center section
+- bottom section
+- left/right placement
 - alignment
 - spacing
-- text colors
+- margins
+- cards
+- panels
+- borders
+- dividers
+
+============================================================
+5. TYPOGRAPHY
+============================================================
+
+Describe:
+- font style
+- font weight
+- approximate size hierarchy
+- uppercase/lowercase
+- alignment
+- text color
 - outlines
 - shadows
 - glow
-- other effects
+- spacing
 
-6. COLOR PALETTE
+============================================================
+6. COLORS
+============================================================
+
 Describe:
-- dominant background colors
+- background
+- primary colors
 - secondary colors
 - accent colors
-- text colors
 - gradients
 - highlights
 - shadows
 
+============================================================
 7. BACKGROUND
+============================================================
+
 Describe:
 - texture
-- grain
 - lighting
-- stadium/sports atmosphere
-- patterns
+- atmosphere
 - depth
-- shadows
-- glow
 - blur
+- patterns
+- gradients
+- shadows
 - environmental details
 
+============================================================
 8. GRAPHIC ELEMENTS
-Describe legitimate visual elements such as:
-- players
-- silhouettes
-- sports equipment
-- stadium elements
-- abstract shapes
-- arrows
-- badges
+============================================================
+
+Describe legitimate:
 - icons
+- arrows
+- shapes
 - lines
+- badges
+- panels
 - borders
-- effects
+- decorative elements
 
-9. GIF / ANIMATION ANALYSIS
-If multiple frames are provided:
-- describe what changes between frames
-- describe movement
-- describe transitions
-- identify which elements remain fixed
-- identify which elements animate
-- describe the overall animation concept
+============================================================
+9. ANIMATION
+============================================================
 
-10. FINAL RECREATION SPECIFICATION
-Finish with a clear, detailed instruction set for an
-image-generation model.
+If the image is a contact sheet from a GIF:
 
-The goal is NOT to copy the original image pixel-for-pixel.
+Describe:
+- what changes between frames
+- movement
+- transitions
+- which elements remain fixed
+- which elements change
+- overall animation concept
 
-The goal is to create a new image that captures:
-- the same type of composition
-- similar visual hierarchy
-- similar design language
+============================================================
+10. FINAL GENERATION SPECIFICATION
+============================================================
+
+Finish with a detailed specification that another image
+generator can use to create a NEW image with:
+
+- similar composition
+- similar hierarchy
+- similar visual style
 - similar color relationships
 - similar legitimate information
-- similar overall visual impression
+- similar overall design language
 
-while excluding third-party watermarks,
-usernames, handles, logos, and channel branding.
+while excluding watermarks, usernames, @handles,
+channel branding and third-party logos.
 
-Do not shorten the analysis.
 Do not invent information.
-Do not add information that is not present.
 """
 
     # ========================================================
-    # RETRIES
+    # VISION REQUEST
     # ========================================================
 
-    max_retries = 4
-    base_delay = 2
+    max_retries = 3
 
     for attempt in range(
         max_retries
@@ -668,8 +773,8 @@ Do not add information that is not present.
         try:
 
             print(
-                "🔍 Sending image to OpenAI Vision "
-                f"(attempt {attempt + 1}/{max_retries})..."
+                f"🔍 OpenAI Vision request "
+                f"{attempt + 1}/{max_retries}"
             )
 
             response = (
@@ -681,12 +786,12 @@ Do not add information that is not present.
                             "content": [
                                 {
                                     "type": "text",
-                                    "text": vision_prompt,
+                                    "text": prompt,
                                 },
                                 {
                                     "type": "image_url",
                                     "image_url": {
-                                        "url": data_url,
+                                        "url": image_url,
                                         "detail": "high",
                                     },
                                 },
@@ -702,29 +807,29 @@ Do not add information that is not present.
                 .choices[0]
                 .message
                 .content
-                .strip()
             )
 
             if not description:
 
                 print(
-                    "❌ OpenAI Vision returned "
-                    "an empty description."
+                    "❌ Vision returned empty text."
                 )
 
                 return None
 
+            description = description.strip()
+
             print(
-                "✅ OpenAI Vision deconstruction "
-                f"complete: {len(description)} characters"
+                f"✅ Vision deconstruction complete "
+                f"({len(description)} chars)"
             )
 
             print(
-                "🧩 Deconstruction preview:"
+                "🧩 Vision preview:"
             )
 
             print(
-                description[:1000]
+                description[:1200]
             )
 
             return description
@@ -737,18 +842,59 @@ Do not add information that is not present.
                 None,
             )
 
-            if status_code == 429:
+            print(
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            )
+
+            print(
+                "❌ OPENAI VISION ERROR"
+            )
+
+            print(
+                "❌ Type:",
+                type(e).__name__,
+            )
+
+            print(
+                "❌ Error:",
+                str(e),
+            )
+
+            print(
+                "❌ Status:",
+                status_code,
+            )
+
+            if hasattr(
+                e,
+                "body",
+            ):
+
+                print(
+                    "❌ Body:",
+                    getattr(
+                        e,
+                        "body",
+                        None,
+                    ),
+                )
+
+            print(
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            )
+
+            if (
+                status_code == 429
+                and attempt < max_retries - 1
+            ):
 
                 wait = (
-                    base_delay
-                    * (
-                        2 ** attempt
-                    )
+                    2 ** attempt
                 )
 
                 print(
-                    "⚠️ OpenAI Vision rate limit "
-                    f"(429). Retry in {wait}s"
+                    f"⏳ Retrying Vision in "
+                    f"{wait}s..."
                 )
 
                 await asyncio.sleep(
@@ -757,16 +903,7 @@ Do not add information that is not present.
 
                 continue
 
-            print(
-                f"❌ OpenAI Vision error: {e}"
-            )
-
             return None
-
-    print(
-        "❌ OpenAI Vision failed "
-        "after all retries."
-    )
 
     return None
 
@@ -779,8 +916,8 @@ async def generate_image_from_description(
     description: str,
 ):
     """
-    Generate a completely new image from the
-    OpenAI Vision reconstruction specification.
+    Generate a NEW image from the Vision
+    reconstruction specification.
     """
 
     global _last_generation_call
@@ -788,29 +925,18 @@ async def generate_image_from_description(
     if not description:
 
         print(
-            "❌ Generation skipped: "
-            "empty reconstruction specification."
+            "❌ Empty reconstruction description."
         )
 
         return None
 
-    if len(description.strip()) < 10:
-
-        print(
-            "❌ Generation skipped: "
-            "reconstruction specification is too short."
-        )
-
-        return None
-
-    # --------------------------------------------------------
-    # Cooldown
-    # --------------------------------------------------------
-
-    now = time.time()
+    # ========================================================
+    # COOLDOWN
+    # ========================================================
 
     elapsed = (
-        now - _last_generation_call
+        time.time()
+        - _last_generation_call
     )
 
     if elapsed < _generation_cooldown:
@@ -818,11 +944,6 @@ async def generate_image_from_description(
         wait = (
             _generation_cooldown
             - elapsed
-        )
-
-        print(
-            f"⏳ Waiting {wait:.1f}s "
-            f"before next image generation..."
         )
 
         await asyncio.sleep(
@@ -835,138 +956,143 @@ async def generate_image_from_description(
     # GENERATION PROMPT
     # ========================================================
 
-    final_prompt = f"""
-Create a NEW high-resolution sports graphic based on the
+    generation_prompt = f"""
+Create a NEW professional sports graphic using the
 reconstruction specification below.
 
-This must be a newly generated image.
+This is a NEW generated image, not an edited copy.
 
 ============================================================
-RECREATION RULES
+DESIGN
 ============================================================
 
-- Create a new independently generated image.
-- Recreate the overall visual composition.
-- Recreate the visual hierarchy.
-- Recreate the general spacing.
-- Recreate the card/panel structure.
-- Recreate the typography style.
-- Recreate the color relationships.
-- Recreate the background treatment.
-- Recreate the lighting and depth.
-- Recreate legitimate visual content described below.
+Preserve the described:
+- composition
+- hierarchy
+- spacing
+- visual structure
+- colors
+- typography style
+- background treatment
+- legitimate information
 
-Preserve legitimate visible information as accurately as
-possible.
+============================================================
+TEXT
+============================================================
 
-Do NOT invent:
-- odds
+Make legitimate text as accurate and readable as possible.
+
+Do not invent:
 - scores
+- odds
+- dates
 - teams
 - players
-- dates
-- times
 - picks
 - numbers
-- other factual information
 
-IMPORTANT:
+============================================================
+EXCLUDE
+============================================================
 
-Do NOT reproduce:
+Do NOT include:
 - watermarks
 - usernames
 - @handles
-- channel names
-- social-media branding
+- social-media handles
+- channel branding
 - third-party logos
-- copied brand marks
+- third-party brand marks
 
-If the reconstruction specification identifies an area that
-previously contained branding, replace that area with a
-clean visually appropriate background/design element.
+Any area that previously contained such material should
+become a clean part of the new design.
 
-Do not mention the reconstruction process in the image.
+============================================================
+QUALITY
+============================================================
 
-Make important text:
-- clean
-- readable
-- sharp
-- professionally arranged
-
-The result should look like a polished new sports graphic,
-not like an edited screenshot.
+Create:
+- sharp text
+- professional typography
+- clean spacing
+- strong hierarchy
+- polished sports-graphic appearance
+- coherent colors
+- clean background
+- high visual quality
 
 ============================================================
 RECONSTRUCTION SPECIFICATION
 ============================================================
 
 {description}
-
-============================================================
-FINAL QUALITY REQUIREMENTS
-============================================================
-
-Generate one cohesive image.
-
-Prioritize:
-1. correct composition
-2. correct legitimate information
-3. readable typography
-4. consistent spacing
-5. coherent colors
-6. professional sports-graphic appearance
-7. clean background
-8. no watermarks or handles
 """
+
+    # ========================================================
+    # REQUEST
+    # ========================================================
 
     try:
 
         print(
-            "🎨 Generating NEW image from "
-            "full reconstruction specification..."
+            "🎨 Sending reconstruction "
+            "specification to image generation..."
         )
 
         print(
-            f"📝 Generation prompt length: "
-            f"{len(final_prompt)} characters"
+            f"📝 Prompt length: "
+            f"{len(generation_prompt)} characters"
         )
 
         response = (
             openai_client.images.generate(
                 model="gpt-image-2",
-                prompt=final_prompt,
+                prompt=generation_prompt,
                 n=1,
             )
         )
 
-        if not response.data:
+        # ====================================================
+        # CHECK RESPONSE
+        # ====================================================
+
+        if not response:
 
             print(
-                "❌ OpenAI image generation "
-                "returned no data."
+                "❌ OpenAI returned no response."
             )
 
             return None
 
-        img_data = response.data[0]
+        if not response.data:
 
-        # ----------------------------------------------------
-        # Base64 response
-        # ----------------------------------------------------
+            print(
+                "❌ OpenAI returned no image data."
+            )
 
-        if getattr(
-            img_data,
+            return None
+
+        image_data = response.data[0]
+
+        # ====================================================
+        # BASE64
+        # ====================================================
+
+        b64_json = getattr(
+            image_data,
             "b64_json",
             None,
-        ):
+        )
+
+        if b64_json:
 
             image_bytes = base64.b64decode(
-                img_data.b64_json
+                b64_json
             )
 
             print(
-                f"✅ New image generated: "
-                f"{len(image_bytes)} bytes"
+                f"✅ NEW IMAGE GENERATED "
+                f"({len(image_bytes)} bytes)"
             )
 
             return BufferedInputFile(
@@ -974,24 +1100,27 @@ Prioritize:
                 filename="regenerated.png",
             )
 
-        # ----------------------------------------------------
-        # URL response
-        # ----------------------------------------------------
+        # ====================================================
+        # URL
+        # ====================================================
 
-        if getattr(
-            img_data,
+        image_url = getattr(
+            image_data,
             "url",
             None,
-        ):
+        )
+
+        if image_url:
 
             print(
-                "✅ New image generated as URL."
+                "✅ NEW IMAGE GENERATED "
+                "as URL."
             )
 
-            return img_data.url
+            return image_url
 
         print(
-            "❌ Image response contained "
+            "❌ OpenAI response contained "
             "neither b64_json nor URL."
         )
 
@@ -999,37 +1128,115 @@ Prioritize:
 
     except Exception as e:
 
+        # ====================================================
+        # THIS IS IMPORTANT
+        # ====================================================
+        #
+        # The previous version only showed:
+        #
+        # 400 Bad Request
+        #
+        # This version prints the actual OpenAI error body.
+        # ====================================================
+
         print(
-            f"❌ OpenAI image generation error: {e}"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         )
 
-        if hasattr(
+        print(
+            "❌ OPENAI IMAGE GENERATION ERROR"
+        )
+
+        print(
+            "❌ Exception type:",
+            type(e).__name__,
+        )
+
+        print(
+            "❌ Exception:",
+            str(e),
+        )
+
+        print(
+            "❌ Status code:",
+            getattr(
+                e,
+                "status_code",
+                None,
+            ),
+        )
+
+        print(
+            "❌ Error code:",
+            getattr(
+                e,
+                "code",
+                None,
+            ),
+        )
+
+        print(
+            "❌ Parameter:",
+            getattr(
+                e,
+                "param",
+                None,
+            ),
+        )
+
+        body = getattr(
+            e,
+            "body",
+            None,
+        )
+
+        if body:
+
+            print(
+                "❌ API ERROR BODY:"
+            )
+
+            print(
+                body
+            )
+
+        response_obj = getattr(
             e,
             "response",
-        ):
+            None,
+        )
+
+        if response_obj:
 
             try:
 
                 print(
-                    f"📄 API response: "
-                    f"{e.response.text}"
+                    "❌ API RESPONSE:"
+                )
+
+                print(
+                    response_obj
                 )
 
             except Exception:
                 pass
 
+        print(
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
+
         return None
 
 
 # ============================================================
-# COMPLETE IMAGE PIPELINE
+# COMPLETE REGENERATION PIPELINE
 # ============================================================
 
 async def regenerate_image_from_bytes(
     image_bytes: bytes,
 ):
     """
-    Complete image recreation pipeline.
+    Complete pipeline:
 
         Telegram image/GIF
                 ↓
@@ -1037,17 +1244,18 @@ async def regenerate_image_from_bytes(
                 ↓
         OpenAI Vision
                 ↓
-        Detailed deconstruction
+        Deconstruction
                 ↓
         OpenAI image generation
                 ↓
-        NEW clean image
+        NEW IMAGE
     """
 
     if not image_bytes:
 
         print(
-            "❌ No image bytes supplied."
+            "❌ regenerate_image_from_bytes "
+            "received no bytes."
         )
 
         return None
@@ -1065,7 +1273,7 @@ async def regenerate_image_from_bytes(
     )
 
     # ========================================================
-    # STEP 1
+    # STEP 1 — VISION
     # ========================================================
 
     print(
@@ -1073,17 +1281,32 @@ async def regenerate_image_from_bytes(
         "OpenAI Vision deconstruction..."
     )
 
-    description = (
-        await describe_image_bytes(
-            image_bytes
-        )
-    )
+    try:
 
-    if not description:
+        description = (
+            await describe_image_bytes(
+                image_bytes
+            )
+        )
+
+    except Exception as e:
 
         print(
-            "❌ STEP 1 FAILED — "
-            "no reconstruction specification."
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
+
+        print(
+            "❌ VISION PIPELINE CRASHED"
+        )
+
+        print(
+            "❌ Type:",
+            type(e).__name__,
+        )
+
+        print(
+            "❌ Error:",
+            str(e),
         )
 
         print(
@@ -1092,8 +1315,21 @@ async def regenerate_image_from_bytes(
 
         return None
 
+    if not description:
+
+        print(
+            "❌ STEP 1 FAILED."
+        )
+
+        print(
+            "❌ No reconstruction specification "
+            "was returned."
+        )
+
+        return None
+
     # ========================================================
-    # STEP 2
+    # STEP 2 — GENERATION
     # ========================================================
 
     print(
@@ -1101,24 +1337,59 @@ async def regenerate_image_from_bytes(
         "OpenAI image generation..."
     )
 
-    generated = (
-        await generate_image_from_description(
-            description
+    try:
+
+        generated = (
+            await generate_image_from_description(
+                description
+            )
         )
+
+    except Exception as e:
+
+        print(
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
+
+        print(
+            "❌ GENERATION PIPELINE CRASHED"
+        )
+
+        print(
+            "❌ Type:",
+            type(e).__name__,
+        )
+
+        print(
+            "❌ Error:",
+            str(e),
+        )
+
+        print(
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
+
+        return None
+
+    if not generated:
+
+        print(
+            "❌ STEP 2 FAILED."
+        )
+
+        print(
+            "❌ No regenerated image was produced."
+        )
+
+        return None
+
+    print(
+        "✅ NEW IMAGE CREATED"
     )
 
-    if generated:
-
-        print(
-            "✅ IMAGE RECREATION PIPELINE COMPLETE"
-        )
-
-    else:
-
-        print(
-            "❌ STEP 2 FAILED — "
-            "image generation failed."
-        )
+    print(
+        "✅ IMAGE RECREATION PIPELINE COMPLETE"
+    )
 
     print(
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
