@@ -11,16 +11,19 @@ from aiogram.types import BufferedInputFile
 
 
 # ============================================================
-# CLIENTS
+# API CLIENTS
 # ============================================================
 
+# Kept for compatibility with your .env, but DeepSeek is NOT used
+# for rewriting anymore. We need an exact username replacement,
+# not an AI rewrite that can change betting information.
 deepseek_client = OpenAI(
     api_key=os.getenv("DEEPSEEK_API_KEY"),
-    base_url="https://api.deepseek.com/v1",
+    base_url="https://api.deepseek.com/v1"
 )
 
 openai_client = OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY"),
+    api_key=os.getenv("OPENAI_API_KEY")
 )
 
 
@@ -31,10 +34,6 @@ openai_client = OpenAI(
 NEW_MENTION = os.getenv("NEW_MENTION", "").strip()
 OLD_MENTION = os.getenv("OLD_MENTION", "@cappersfree").strip()
 
-# OpenAI models
-VISION_MODEL = os.getenv("VISION_MODEL", "gpt-5.6-luna")
-IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-2")
-
 _last_vision_call = 0.0
 _vision_cooldown = 8
 
@@ -43,14 +42,22 @@ _generation_cooldown = 8
 
 
 # ============================================================
-# USERNAME REPLACEMENT
-# DeepSeek's ONLY job here is replacing OLD_MENTION with
-# NEW_MENTION. A deterministic validation/fallback guarantees
-# that no other text is changed.
+# TEXT PROCESSING
 # ============================================================
 
-def replace_username_locally(text: str) -> str:
-    if not text or not OLD_MENTION or not NEW_MENTION:
+def replace_username(text: str) -> str:
+    """
+    Change ONLY the old username to the new username.
+
+    No rewriting.
+    No paraphrasing.
+    No removal of other @mentions.
+    No changes to odds, teams, numbers, punctuation, etc.
+    """
+    if not text:
+        return text
+
+    if not NEW_MENTION:
         return text
 
     return re.sub(
@@ -61,105 +68,38 @@ def replace_username_locally(text: str) -> str:
     )
 
 
-def same_except_username(original: str, candidate: str) -> bool:
-    """
-    Returns True only when replacing OLD_MENTION with NEW_MENTION
-    in the original produces exactly the candidate.
-    """
-    expected = replace_username_locally(original)
-    return candidate == expected
-
-
 async def rewrite_text(original_text: str) -> str:
     """
-    DeepSeek is NOT allowed to rewrite, paraphrase, summarize,
-    reorder, or modify anything except the configured username.
+    Kept with the old function name so main.py does not need to change
+    its import.
+
+    IMPORTANT:
+    DeepSeek is intentionally NOT called here.
+
+    The requirement is an exact username replacement, and deterministic
+    replacement is safer than asking an LLM to rewrite the message.
     """
-    if not original_text:
-        return original_text
-
-    # Nothing to replace -> don't waste an API call.
-    if (
-        not OLD_MENTION
-        or not NEW_MENTION
-        or not re.search(re.escape(OLD_MENTION), original_text, flags=re.IGNORECASE)
-    ):
-        return original_text
-
-    system_prompt = (
-        "You are an exact text replacement engine. "
-        "Do NOT rewrite, paraphrase, correct grammar, summarize, "
-        "format, add, remove, reorder, or change any text. "
-        f"Replace every case-insensitive occurrence of {OLD_MENTION!r} "
-        f"with {NEW_MENTION!r}. "
-        "Every other character must remain exactly identical. "
-        "Return ONLY the resulting text."
-    )
-
-    try:
-        response = deepseek_client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": original_text},
-            ],
-            temperature=0,
-            max_tokens=max(100, min(4000, len(original_text) * 2)),
-        )
-
-        result = (response.choices[0].message.content or "").strip()
-
-        # DeepSeek must not alter anything else.
-        if same_except_username(original_text, result):
-            return result
-
-        print("⚠️ DeepSeek changed more than the username. Using exact local replacement.")
-        return replace_username_locally(original_text)
-
-    except Exception as e:
-        print(f"❌ DeepSeek username replacement error: {e}")
-        # Guaranteed exact fallback.
-        return replace_username_locally(original_text)
+    return replace_username(original_text)
 
 
 # ============================================================
-# IMAGE PREPARATION
+# IMAGE VISION / DECONSTRUCTION
 # ============================================================
 
-def image_bytes_to_data_url(image_bytes: bytes) -> str:
-    img = Image.open(BytesIO(image_bytes))
+async def describe_image_bytes(image_bytes: bytes):
+    """
+    Send the ORIGINAL image to OpenAI Vision and create a detailed
+    reconstruction specification.
 
-    if getattr(img, "is_animated", False):
-        img.seek(0)
+    This is the first step of the image pipeline:
+        ORIGINAL IMAGE -> OPENAI VISION -> RECONSTRUCTION SPEC
+    """
 
-    if img.mode not in ("RGB", "RGBA"):
-        img = img.convert("RGB")
-
-    # Flatten transparency onto white before JPEG conversion.
-    if img.mode == "RGBA":
-        background = Image.new("RGB", img.size, "white")
-        background.paste(img, mask=img.getchannel("A"))
-        img = background
-
-    buffered = BytesIO()
-    img.save(buffered, format="JPEG", quality=92, optimize=True)
-
-    encoded = base64.b64encode(buffered.getvalue()).decode("utf-8")
-    return f"data:image/jpeg;base64,{encoded}"
-
-
-# ============================================================
-# OPENAI STEP 1:
-# DECONSTRUCT / EXPLAIN THE SOURCE IMAGE
-#
-# The model extracts reusable visual information. It must ignore
-# usernames, handles, logos, signatures, and watermark elements.
-# ============================================================
-
-async def describe_image_bytes(image_bytes: bytes) -> str | None:
     global _last_vision_call
 
-    elapsed = time.time() - _last_vision_call
+    now = time.time()
+    elapsed = now - _last_vision_call
+
     if elapsed < _vision_cooldown:
         wait = _vision_cooldown - elapsed
         print(f"⏳ Waiting {wait:.1f}s before next Vision call...")
@@ -168,160 +108,339 @@ async def describe_image_bytes(image_bytes: bytes) -> str | None:
     _last_vision_call = time.time()
 
     try:
-        data_url = image_bytes_to_data_url(image_bytes)
+        img = Image.open(BytesIO(image_bytes))
+
+        if getattr(img, "is_animated", False):
+            img.seek(0)
+
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+
+        # Keep the source reasonably sized for the vision request.
+        # Do NOT destroy the important visual detail.
+        max_dimension = 2048
+
+        if max(img.size) > max_dimension:
+            scale = max_dimension / max(img.size)
+            new_size = (
+                max(1, int(img.width * scale)),
+                max(1, int(img.height * scale)),
+            )
+            img = img.resize(new_size, Image.Resampling.LANCZOS)
+
+        buffered = BytesIO()
+        img.save(buffered, format="JPEG", quality=95)
+
+        img_base64 = base64.b64encode(
+            buffered.getvalue()
+        ).decode("utf-8")
+
+        data_url = f"data:image/jpeg;base64,{img_base64}"
 
         vision_prompt = """
-Analyze this image as a reference for creating a NEW, original but visually similar graphic.
+You are the visual analyst for an image recreation pipeline.
 
-First deconstruct the image in detail. Describe:
-1. Canvas orientation and approximate aspect ratio.
-2. Background colors, texture, lighting, gradients, patterns, and atmosphere.
-3. Layout: position and hierarchy of all important visual sections.
-4. Typography: approximate font personality, weight, capitalization, alignment, spacing, and size hierarchy.
-5. All visible content that is important to the graphic: titles, team names, league names, odds, scores, dates, times, player names, stakes, and other numbers.
-6. Shapes, borders, cards, panels, dividers, icons, arrows, glow, shadows, and accent colors.
-7. The overall design style and visual mood.
+Your job is to DECONSTRUCT the supplied image so another image-generation
+model can create a new image with the same overall visual structure.
 
-IMPORTANT:
-- Do NOT include or reproduce any watermark.
-- Ignore usernames, @handles, channel names, social media tags, logos, signatures, and branding marks.
-- Do not treat those ignored elements as part of the new design.
-- Preserve only legitimate content and reusable visual/layout characteristics.
-- This is analysis for generating a NEW image, not instructions to edit the source image.
+IMPORTANT WATERMARK / BRANDING RULE:
+- Do NOT reproduce watermarks.
+- Do NOT reproduce usernames or social-media handles.
+- Do NOT reproduce channel names, logos, or identifiable branding.
+- Ignore those elements completely.
+- If a username or watermark is present, simply state internally that it
+  must be excluded from the new image. Do not put the actual username in
+  the reconstruction specification.
 
-Return a detailed, structured design brief that can be given directly to an image generation model.
-""".strip()
+Everything else that is legitimate content in the image should be captured.
+
+Analyze the image carefully and provide a detailed reconstruction
+specification containing:
+
+1. CANVAS
+- orientation
+- approximate aspect ratio
+- overall dimensions/proportions
+
+2. EXACT CONTENT
+- all visible sports/betting information
+- league/competition
+- team names
+- player names
+- matchup
+- scores
+- odds
+- times
+- dates
+- stake amounts
+- picks
+- headings
+- labels
+- emojis
+- all other meaningful numbers and text
+
+Preserve the exact wording and numbers of legitimate content as closely
+as possible.
+
+3. COMPOSITION
+- exact placement of major elements
+- top/center/bottom sections
+- left/right alignment
+- margins
+- spacing
+- hierarchy
+- cards
+- panels
+- dividers
+- borders
+- frames
+- icons
+- decorative elements
+
+4. TYPOGRAPHY
+- approximate font family/style
+- uppercase/lowercase
+- boldness
+- relative sizes
+- letter spacing
+- alignment
+- text colors
+- special effects
+
+5. COLOR PALETTE
+- dominant background color
+- secondary colors
+- accent colors
+- text colors
+- gradients
+- highlights
+
+6. BACKGROUND
+- texture
+- grain
+- stadium/sports atmosphere
+- lighting
+- patterns
+- shadows
+- glow
+- depth
+
+7. IMAGE / GRAPHIC ELEMENTS
+Describe legitimate visual elements such as:
+- team/player imagery
+- silhouettes
+- sports equipment
+- stadium elements
+- abstract shapes
+- arrows
+- badges
+- icons
+- lines
+- effects
+
+8. FINAL RECREATION INSTRUCTIONS
+Finish with a concise but detailed set of instructions for an image
+generation model explaining how to recreate the composition and style.
+
+Do NOT shorten the analysis.
+Do NOT omit details simply because they are small.
+Do NOT rewrite or invent betting information.
+Do NOT include watermarks, usernames, handles, logos, or channel branding
+in the final reconstruction specification.
+"""
 
         max_retries = 4
         base_delay = 2
 
         for attempt in range(max_retries):
             try:
-                response = openai_client.responses.create(
-                    model=VISION_MODEL,
-                    input=[
+                print(
+                    "🔍 Sending ORIGINAL image to OpenAI Vision "
+                    f"(attempt {attempt + 1}/{max_retries})..."
+                )
+
+                response = openai_client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
                         {
                             "role": "user",
                             "content": [
                                 {
-                                    "type": "input_text",
+                                    "type": "text",
                                     "text": vision_prompt,
                                 },
                                 {
-                                    "type": "input_image",
-                                    "image_url": data_url,
-                                    "detail": "high",
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": data_url,
+                                        "detail": "high",
+                                    },
                                 },
                             ],
                         }
                     ],
+                    max_tokens=2500,
                 )
 
-                description = (response.output_text or "").strip()
+                description = (
+                    response.choices[0]
+                    .message.content
+                    .strip()
+                )
 
-                if description:
-                    print(f"✅ Image design brief created ({len(description)} chars)")
-                    return description
+                if not description:
+                    print("❌ OpenAI Vision returned an empty description.")
+                    return None
 
-                print("❌ Vision returned an empty design brief.")
-                return None
+                print(
+                    "✅ OpenAI Vision deconstruction complete: "
+                    f"{len(description)} characters"
+                )
+                print(
+                    "🧩 Deconstruction preview: "
+                    f"{description[:500]}"
+                )
+
+                return description
 
             except Exception as e:
-                status = getattr(e, "status_code", None)
+                status_code = getattr(e, "status_code", None)
 
-                if status == 429 and attempt < max_retries - 1:
+                if status_code == 429:
                     wait = base_delay * (2 ** attempt)
+
                     print(
-                        f"⚠️ Rate limit. Retry {attempt + 1}/{max_retries} "
-                        f"in {wait}s..."
+                        f"⚠️ OpenAI Vision rate limit (429). "
+                        f"Retry {attempt + 1}/{max_retries} in {wait}s"
                     )
+
                     await asyncio.sleep(wait)
                     continue
 
-                print(f"❌ OpenAI vision error: {e}")
+                print(f"❌ OpenAI Vision error: {e}")
                 return None
 
+        print("❌ OpenAI Vision failed after all retries.")
         return None
 
     except Exception as e:
-        print(f"❌ Image preparation error: {e}")
+        print(f"❌ Vision image preparation error: {e}")
         return None
 
 
 # ============================================================
-# OPENAI STEP 2:
-# GENERATE A NEW SIMILAR IMAGE FROM THE DESIGN BRIEF
-#
-# This intentionally creates a fresh image from the extracted
-# description rather than editing the original source image.
+# IMAGE GENERATION
 # ============================================================
 
 async def generate_image_from_description(description: str):
+    """
+    Generate a NEW image from the complete OpenAI Vision
+    reconstruction specification.
+
+    IMPORTANT:
+    The description is NOT truncated to 250 characters.
+    """
+
     global _last_generation_call
 
     if not description or len(description.strip()) < 10:
+        print("❌ Generation skipped: reconstruction specification is empty.")
         return None
 
-    elapsed = time.time() - _last_generation_call
+    now = time.time()
+    elapsed = now - _last_generation_call
+
     if elapsed < _generation_cooldown:
         wait = _generation_cooldown - elapsed
-        print(f"⏳ Waiting {wait:.1f}s before image generation...")
+
+        print(
+            f"⏳ Waiting {wait:.1f}s before next image generation..."
+        )
+
         await asyncio.sleep(wait)
 
     _last_generation_call = time.time()
 
-    generation_prompt = f"""
-Create a NEW, original high-quality sports betting/social media graphic using the following design brief as visual guidance.
+    final_prompt = f"""
+Create a NEW, high-resolution sports graphic based on the reconstruction
+specification below.
+
+The supplied specification was produced by analyzing an original image.
+
+RECREATION RULES:
+
+- Create a NEW independently generated image.
+- Match the original image's overall composition, proportions, hierarchy,
+  spacing, typography style, colors, background treatment, texture,
+  lighting, borders, and decorative structure as closely as possible.
+- Preserve legitimate sports and betting information exactly.
+- Preserve team names, player names, odds, scores, dates, times, picks,
+  and other legitimate numbers/text from the specification.
+- Make all important text clean, sharp, readable, and professionally
+  typeset.
+- Do NOT invent betting information.
+- Do NOT add extra teams, odds, scores, or numbers.
+- Do NOT include any watermark.
+- Do NOT include any username or social-media handle.
+- Do NOT include channel branding.
+- Do NOT include logos or copied branding.
+- If the original contained a watermark, username, handle, logo, or
+  channel branding, replace that area with a visually appropriate clean
+  background rather than reproducing it.
+- Do not mention the reconstruction process in the generated image.
+
+RECONSTRUCTION SPECIFICATION:
 
 {description}
-
-Requirements:
-- Recreate the overall visual concept, information hierarchy, layout logic, color palette, typography hierarchy, texture, and mood described in the brief.
-- Generate a fresh composition rather than copying pixels from the reference.
-- Keep all legitimate betting/game information from the design brief accurate.
-- Do NOT include any watermark, @username, social handle, channel name, logo, signature, or branding mark that was present in the reference.
-- Do NOT add a replacement watermark or invented branding.
-- Keep text crisp, readable, correctly spelled, and well aligned.
-- Do not add extra betting picks, teams, odds, scores, or numbers that were not present in the design brief.
-- Output only the finished graphic.
-""".strip()
+"""
 
     try:
-        print(f"🎨 Generating with {IMAGE_MODEL}...")
-        print(f"📝 Generation prompt length: {len(generation_prompt)} chars")
+        print(
+            "🎨 Generating NEW image from FULL reconstruction specification..."
+        )
+        print(
+            f"📝 Generation prompt length: {len(final_prompt)} characters"
+        )
 
         response = openai_client.images.generate(
-            model=IMAGE_MODEL,
-            prompt=generation_prompt,
+            model="gpt-image-2",
+            prompt=final_prompt,
             n=1,
         )
 
         if not response.data:
-            print("❌ Image generation returned no data.")
+            print("❌ OpenAI image generation returned no data.")
             return None
 
-        image_data = response.data[0]
+        img_data = response.data[0]
 
-        if getattr(image_data, "b64_json", None):
-            generated_bytes = base64.b64decode(image_data.b64_json)
-            return BufferedInputFile(
-                file=generated_bytes,
-                filename="generated.png",
+        if getattr(img_data, "b64_json", None):
+            image_bytes = base64.b64decode(
+                img_data.b64_json
             )
 
-        if getattr(image_data, "url", None):
-            return image_data.url
+            print(
+                f"✅ New image generated: {len(image_bytes)} bytes"
+            )
 
-        print("❌ Image generation returned neither b64_json nor url.")
+            return BufferedInputFile(
+                file=image_bytes,
+                filename="regenerated.png",
+            )
+
+        if getattr(img_data, "url", None):
+            print("✅ New image generated as URL.")
+            return img_data.url
+
+        print("❌ Image response contained neither b64_json nor URL.")
         return None
 
     except Exception as e:
         print(f"❌ OpenAI image generation error: {e}")
 
-        response_obj = getattr(e, "response", None)
-        if response_obj is not None:
+        if hasattr(e, "response"):
             try:
-                print(f"📄 Response: {response_obj.text}")
+                print(f"📄 API response: {e.response.text}")
             except Exception:
                 pass
 
@@ -329,19 +448,53 @@ Requirements:
 
 
 # ============================================================
-# COMPLETE PIPELINE
+# FULL IMAGE PIPELINE
 # ============================================================
 
 async def regenerate_image_from_bytes(image_bytes: bytes):
     """
-    1. OpenAI analyzes and deconstructs the reference image.
-    2. OpenAI produces a detailed reusable design brief.
-    3. GPT Image generates a NEW similar graphic from that brief.
+    Complete image pipeline:
+
+        Telegram image
+            ↓
+        OpenAI Vision
+            ↓
+        Detailed deconstruction
+            ↓
+        OpenAI image generation
+            ↓
+        New clean image
     """
+
+    if not image_bytes:
+        print("❌ No image bytes supplied.")
+        return None
+
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("🖼️ IMAGE REGENERATION PIPELINE START")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    # STEP 1: Deconstruct the ORIGINAL image.
+    print("1️⃣ STEP 1/2 — OpenAI Vision deconstruction...")
+
     description = await describe_image_bytes(image_bytes)
 
     if not description:
+        print("❌ STEP 1 FAILED — no reconstruction specification.")
         return None
 
-    print("📋 Design brief ready. Starting new image generation...")
-    return await generate_image_from_description(description)
+    # STEP 2: Generate a NEW image from that specification.
+    print("2️⃣ STEP 2/2 — OpenAI image generation...")
+
+    generated = await generate_image_from_description(
+        description
+    )
+
+    if generated:
+        print("✅ IMAGE REGENERATION PIPELINE COMPLETE")
+    else:
+        print("❌ STEP 2 FAILED — image generation failed.")
+
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    return generated
