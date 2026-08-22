@@ -47,6 +47,11 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID = int(os.getenv("API_ID")) if os.getenv("API_ID") else 0
 API_HASH = os.getenv("API_HASH")
 PHONE = os.getenv("PHONE_NUMBER")
+NEW_MENTION = os.getenv("NEW_MENTION", "").strip()
+
+
+if NEW_MENTION and not NEW_MENTION.startswith("@"):
+    NEW_MENTION = "@" + NEW_MENTION
 
 
 if not BOT_TOKEN or not API_ID or not API_HASH or not PHONE:
@@ -210,13 +215,18 @@ async def process_single_media(
         )
 
         logger.info(
-            f"🔍 [{message_id}] Sending original media "
-            f"to OpenAI Vision..."
+            f"🔍 [{message_id}] Calling image regeneration pipeline..."
         )
 
-        new_image_data = await regenerate_image_from_bytes(
-            image_bytes
-        )
+        try:
+            new_image_data = await regenerate_image_from_bytes(
+                image_bytes
+            )
+        except Exception:
+            logger.exception(
+                f"❌ [{message_id}] UNHANDLED REGENERATION EXCEPTION"
+            )
+            return False
 
         if not new_image_data:
             logger.error(
@@ -518,7 +528,12 @@ async def main():
     )
 
     logger.info(
-        "   Caption handling: EXACT username replacement"
+        "   Caption handling: remove '*' + exact username replacement"
+    )
+
+    logger.info(
+        "   NEW_MENTION: %r",
+        NEW_MENTION,
     )
 
     logger.info(
