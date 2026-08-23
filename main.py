@@ -3,18 +3,13 @@ import asyncio
 import logging
 from pathlib import Path
 
-
 # ============================================================
 # LOAD ENVIRONMENT FIRST
 # ============================================================
 
 from dotenv import load_dotenv
 
-
-env_path = (
-    Path(__file__).parent
-    / ".env"
-)
+env_path = Path(__file__).parent / ".env"
 
 load_dotenv(
     dotenv_path=env_path
@@ -26,10 +21,7 @@ load_dotenv(
 # ============================================================
 
 from aiogram import Bot
-from telethon import (
-    TelegramClient,
-    errors,
-)
+from telethon import TelegramClient, errors
 
 import database
 
@@ -53,9 +45,7 @@ logging.basicConfig(
     ),
 )
 
-logger = logging.getLogger(
-    __name__
-)
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -64,31 +54,27 @@ logger = logging.getLogger(
 
 BOT_TOKEN = (
     os.getenv(
-        "BOT_TOKEN",
-        "",
-    ).strip()
-)
+        "BOT_TOKEN"
+    ) or ""
+).strip()
 
 API_ID_RAW = (
     os.getenv(
-        "API_ID",
-        "",
-    ).strip()
-)
+        "API_ID"
+    ) or ""
+).strip()
 
 API_HASH = (
     os.getenv(
-        "API_HASH",
-        "",
-    ).strip()
-)
+        "API_HASH"
+    ) or ""
+).strip()
 
 PHONE = (
     os.getenv(
-        "PHONE_NUMBER",
-        "",
-    ).strip()
-)
+        "PHONE_NUMBER"
+    ) or ""
+).strip()
 
 
 try:
@@ -103,40 +89,43 @@ except ValueError:
 
 
 # ============================================================
-# VALIDATE ENVIRONMENT
+# VALIDATE CONFIG
 # ============================================================
 
-missing = []
-
 if not BOT_TOKEN:
-    missing.append(
-        "BOT_TOKEN"
+
+    logger.error(
+        "❌ BOT_TOKEN is missing."
     )
 
 if not API_ID:
-    missing.append(
-        "API_ID"
+
+    logger.error(
+        "❌ API_ID is missing or invalid."
     )
 
 if not API_HASH:
-    missing.append(
-        "API_HASH"
+
+    logger.error(
+        "❌ API_HASH is missing."
     )
 
 if not PHONE:
-    missing.append(
-        "PHONE_NUMBER"
-    )
-
-
-if missing:
 
     logger.error(
-        "❌ Missing environment variables: %s",
-        ", ".join(missing),
+        "❌ PHONE_NUMBER is missing."
     )
 
-    raise SystemExit(1)
+if (
+    not BOT_TOKEN
+    or not API_ID
+    or not API_HASH
+    or not PHONE
+):
+
+    raise SystemExit(
+        1
+    )
 
 
 # ============================================================
@@ -155,47 +144,29 @@ user_client = TelegramClient(
 
 
 # ============================================================
-# DEFAULT CHANNEL CONFIGURATION
-# ============================================================
-
-SOURCE_CHANNEL_ID = -1003593544389
-
-TARGET_CHANNEL_ID = -1004415621706
-
-
-# ============================================================
 # PROCESSING STATE
 # ============================================================
-
-# Prevent the same message from being processed twice
-# during this process lifetime.
 
 processing_ids = set()
 
 processing_lock = asyncio.Lock()
 
-
-# Last successfully handled message per source.
-
 last_processed = {}
 
 
 # ============================================================
-# TELEGRAM CONNECTION
+# CONNECTION
 # ============================================================
 
 async def ensure_connection():
-    """
-    Ensure Telethon is connected.
-    """
 
     if user_client.is_connected():
 
         return True
 
     logger.warning(
-        "⚠️ Telegram client disconnected. "
-        "Attempting reconnect..."
+        "⚠️ Client disconnected! "
+        "Attempting to reconnect..."
     )
 
     try:
@@ -208,16 +179,24 @@ async def ensure_connection():
                 phone=PHONE
             )
 
-        logger.info(
-            "✅ Telegram client reconnected."
+        if user_client.is_connected():
+
+            logger.info(
+                "✅ Reconnected successfully!"
+            )
+
+            return True
+
+        logger.error(
+            "❌ Reconnection did not establish connection."
         )
 
-        return True
+        return False
 
     except Exception as e:
 
         logger.exception(
-            "❌ Telegram reconnection failed: %s",
+            "❌ Reconnection failed: %s",
             e,
         )
 
@@ -233,18 +212,18 @@ def get_image_media(msg):
     Return Telegram media that can be processed.
 
     Supports:
-        photo
-        image/*
-        video/*
-        GIF
-        MP4
-        MOV
-        WEBM
-        common image extensions
+
+    - Telegram photos
+    - image documents
+    - GIFs
+    - MP4 GIFs
+    - videos
+    - MOV
+    - WebM
     """
 
     # --------------------------------------------------------
-    # Telegram photo.
+    # TELEGRAM PHOTO
     # --------------------------------------------------------
 
     if getattr(
@@ -256,7 +235,7 @@ def get_image_media(msg):
         return msg.photo
 
     # --------------------------------------------------------
-    # Telegram document.
+    # DOCUMENT
     # --------------------------------------------------------
 
     document = getattr(
@@ -276,24 +255,21 @@ def get_image_media(msg):
             or ""
         ).lower()
 
-        # Image MIME.
-
+        # Images
         if mime_type.startswith(
             "image/"
         ):
 
             return document
 
-        # Video MIME.
-
+        # Videos / Telegram GIFs
         if mime_type.startswith(
             "video/"
         ):
 
             return document
 
-        # Extension fallback.
-
+        # File extension fallback
         attributes = (
             getattr(
                 document,
@@ -336,14 +312,12 @@ def get_image_media(msg):
                 .lower()
             )
 
-            if extension in (
-                supported_extensions
-            ):
+            if extension in supported_extensions:
 
                 return document
 
     # --------------------------------------------------------
-    # Generic media fallback.
+    # FALLBACK MEDIA
     # --------------------------------------------------------
 
     media = getattr(
@@ -352,12 +326,9 @@ def get_image_media(msg):
         None,
     )
 
-    if (
-        media
-        and hasattr(
-            media,
-            "photo",
-        )
+    if media and hasattr(
+        media,
+        "photo",
     ):
 
         return media
@@ -366,7 +337,7 @@ def get_image_media(msg):
 
 
 # ============================================================
-# PROCESS SINGLE IMAGE / GIF
+# PROCESS SINGLE IMAGE
 # ============================================================
 
 async def process_single_media(
@@ -376,30 +347,26 @@ async def process_single_media(
     message_id,
 ):
     """
-    Process one image/GIF:
+    Download original media.
 
-        Telegram
+    Then:
+
+        ORIGINAL
             ↓
-        Download
+        VISION
             ↓
-        Vision
+        DECONSTRUCTION
             ↓
-        Deconstruction
-            ↓
-        Image generation
+        GENERATION
             ↓
         NEW IMAGE
             ↓
-        Target Telegram channel
+        TARGET
 
-    Original media is never posted if generation fails.
+    Original media is never posted if regeneration fails.
     """
 
     try:
-
-        # ----------------------------------------------------
-        # Download.
-        # ----------------------------------------------------
 
         logger.info(
             "🖼️ [%s] Downloading original image/GIF...",
@@ -416,7 +383,7 @@ async def process_single_media(
         if not image_bytes:
 
             logger.error(
-                "❌ [%s] Could not download media.",
+                "❌ [%s] Could not download image.",
                 message_id,
             )
 
@@ -428,62 +395,22 @@ async def process_single_media(
             len(image_bytes),
         )
 
-        try:
-
-            logger.info(
-                "🔬 [%s] Media header: %s",
-                message_id,
-                bytes(
-                    image_bytes[:32]
-                ).hex(" "),
-            )
-
-        except Exception:
-            pass
-
-        # ----------------------------------------------------
-        # Regenerate.
-        # ----------------------------------------------------
-
         logger.info(
-            "🔍 [%s] Starting image recreation:",
+            "🔬 [%s] Media header: %s",
             message_id,
+            bytes(
+                image_bytes[:32]
+            ).hex(" "),
         )
 
-        logger.info(
-            "    ORIGINAL"
-        )
+        # ----------------------------------------------------
+        # REGENERATE
+        # ----------------------------------------------------
 
         logger.info(
-            "       ↓"
-        )
-
-        logger.info(
-            "    OPENAI VISION"
-        )
-
-        logger.info(
-            "       ↓"
-        )
-
-        logger.info(
-            "    DECONSTRUCTION"
-        )
-
-        logger.info(
-            "       ↓"
-        )
-
-        logger.info(
-            "    IMAGE GENERATION"
-        )
-
-        logger.info(
-            "       ↓"
-        )
-
-        logger.info(
-            "    NEW IMAGE"
+            "🔍 [%s] Sending original media "
+            "through OpenAI pipeline...",
+            message_id,
         )
 
         new_image_data = (
@@ -503,7 +430,7 @@ async def process_single_media(
             return False
 
         # ----------------------------------------------------
-        # Send regenerated image.
+        # POST NEW IMAGE
         # ----------------------------------------------------
 
         logger.info(
@@ -511,19 +438,16 @@ async def process_single_media(
             message_id,
         )
 
-        send_kwargs = {
-            "chat_id": target_id,
-            "photo": new_image_data,
-        }
-
-        if caption_text:
-
-            send_kwargs[
-                "caption"
-            ] = caption_text[:1024]
+        final_caption = (
+            caption_text[:1024]
+            if caption_text
+            else None
+        )
 
         await bot.send_photo(
-            **send_kwargs
+            chat_id=target_id,
+            photo=new_image_data,
+            caption=final_caption,
         )
 
         logger.info(
@@ -559,32 +483,21 @@ async def process_channel(
     if not await ensure_connection():
 
         logger.error(
-            "❌ Cannot process channel "
-            "%s because Telegram is disconnected.",
-            source_id,
+            "❌ Cannot process channel: "
+            "client is disconnected."
         )
 
         return
 
     try:
 
-        channel = (
-            await user_client.get_entity(
-                source_id
-            )
+        channel = await user_client.get_entity(
+            source_id
         )
 
-        last_id = (
-            last_processed.get(
-                source_id,
-                0,
-            )
-        )
-
-        logger.info(
-            "🔎 Checking source %s after message %s",
+        last_id = last_processed.get(
             source_id,
-            last_id,
+            0,
         )
 
         new_messages = []
@@ -604,28 +517,25 @@ async def process_channel(
             return
 
         logger.info(
-            "📩 Found %d new message(s) in %s",
+            "📥 Found %d new message(s) "
+            "in source %s",
             len(new_messages),
             source_id,
         )
 
         # ----------------------------------------------------
-        # Process chronologically.
+        # PROCESS MESSAGES
         # ----------------------------------------------------
 
         for msg in new_messages:
-
-            # ------------------------------------------------
-            # Duplicate protection.
-            # ------------------------------------------------
 
             async with processing_lock:
 
                 if msg.id in processing_ids:
 
                     logger.warning(
-                        "⚠️ Message %s already processing. "
-                        "Skipping duplicate.",
+                        "⚠️ Message %s is already "
+                        "being processed. Skipping.",
                         msg.id,
                     )
 
@@ -647,7 +557,7 @@ async def process_channel(
                 )
 
                 # ------------------------------------------------
-                # Caption / text.
+                # CAPTION / TEXT
                 # ------------------------------------------------
 
                 original_text = (
@@ -693,7 +603,7 @@ async def process_channel(
                     )
 
                 # ------------------------------------------------
-                # Media.
+                # MEDIA
                 # ------------------------------------------------
 
                 media = get_image_media(
@@ -724,20 +634,10 @@ async def process_channel(
                             msg.id,
                         )
 
-                        # IMPORTANT:
-                        #
-                        # Do not advance last_processed
-                        # on failure.
-                        #
-                        # This allows a later poll to retry
-                        # the message.
-                        #
-                        continue
-
                 else:
 
                     # ------------------------------------------------
-                    # Text only.
+                    # TEXT ONLY
                     # ------------------------------------------------
 
                     logger.info(
@@ -757,21 +657,11 @@ async def process_channel(
                             msg.id,
                         )
 
-                    else:
-
-                        logger.info(
-                            "📝 [%s] Empty text-only message. "
-                            "Nothing posted.",
-                            msg.id,
-                        )
-
                 # ------------------------------------------------
-                # ONLY mark as processed AFTER SUCCESS.
+                # MARK PROCESSED
                 # ------------------------------------------------
 
-                last_processed[
-                    source_id
-                ] = max(
+                last_processed[source_id] = max(
                     last_processed.get(
                         source_id,
                         0,
@@ -780,15 +670,10 @@ async def process_channel(
                 )
 
                 logger.info(
-                    "✅ [%s] Message successfully handled.",
-                    msg.id,
-                )
-
-                logger.info(
                     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
                 )
 
-                # Small delay.
+                # Small delay between messages.
                 await asyncio.sleep(
                     8
                 )
@@ -824,7 +709,8 @@ async def process_channel(
     except Exception as e:
 
         logger.exception(
-            "❌ Error processing channel %s: %s",
+            "❌ Error processing channel "
+            "%s: %s",
             source_id,
             e,
         )
@@ -835,9 +721,6 @@ async def process_channel(
 # ============================================================
 
 async def poll_channels():
-    """
-    Continuously poll registered source channels.
-    """
 
     while True:
 
@@ -858,7 +741,7 @@ async def poll_channels():
             if not clients:
 
                 logger.warning(
-                    "⚠️ No clients registered in database."
+                    "⚠️ No source/target clients configured."
                 )
 
                 await asyncio.sleep(
@@ -869,91 +752,27 @@ async def poll_channels():
 
             for client in clients:
 
-                source_id = client[
-                    "source"
-                ]
-
-                target_id = client[
-                    "target"
-                ]
+                source = client["source"]
+                target = client["target"]
 
                 await process_channel(
-                    source_id,
-                    target_id,
+                    source,
+                    target,
                 )
 
             await asyncio.sleep(
                 5
             )
 
-        except asyncio.CancelledError:
-
-            raise
-
-        except Exception:
+        except Exception as e:
 
             logger.exception(
-                "❌ Polling loop error."
+                "❌ Polling loop error: %s",
+                e,
             )
 
             await asyncio.sleep(
                 10
-            )
-
-
-# ============================================================
-# INITIALIZE LAST PROCESSED
-# ============================================================
-
-async def initialize_last_processed():
-    """
-    Start from the newest message in each configured source.
-
-    This prevents the first startup from regenerating all
-    historical messages.
-    """
-
-    clients = (
-        database.get_all_clients()
-    )
-
-    for client in clients:
-
-        source = client[
-            "source"
-        ]
-
-        try:
-
-            channel = (
-                await user_client.get_entity(
-                    source
-                )
-            )
-
-            async for msg in user_client.iter_messages(
-                channel,
-                limit=1,
-            ):
-
-                last_processed[
-                    source
-                ] = msg.id
-
-                logger.info(
-                    "📌 Source %s starts after message %s",
-                    source,
-                    msg.id,
-                )
-
-                break
-
-        except Exception as e:
-
-            logger.exception(
-                "❌ Could not initialize source %s: %s",
-                source,
-                e,
             )
 
 
@@ -968,37 +787,26 @@ async def main():
     )
 
     logger.info(
-        "📝 Caption handling: EXACT username replacement"
+        "   Caption handling: EXACT username replacement"
     )
 
     logger.info(
-        "🖼️ Image handling: "
-        "Vision → Deconstruction → Generation"
+        "   Image handling: Vision → Deconstruction → Generation"
     )
 
     # --------------------------------------------------------
-    # Start Telegram user client.
+    # START TELEGRAM
     # --------------------------------------------------------
 
-    try:
-
-        await user_client.start(
-            phone=PHONE,
-            force_sms=True,
-        )
-
-    except Exception:
-
-        logger.exception(
-            "❌ Failed to start Telegram client."
-        )
-
-        raise
+    await user_client.start(
+        phone=PHONE,
+        force_sms=True,
+    )
 
     if not user_client.is_connected():
 
         logger.error(
-            "❌ Telegram client is not connected!"
+            "❌ Failed to connect on startup!"
         )
 
         return
@@ -1008,56 +816,84 @@ async def main():
     )
 
     # --------------------------------------------------------
-    # Register default source → target.
+    # REGISTER DEFAULT SOURCE → TARGET
     # --------------------------------------------------------
 
-    try:
+    source_channel_id = -1003593544389
+    target_channel_id = -1004415621706
 
-        existing = (
-            database.get_target_for_source(
-                SOURCE_CHANNEL_ID
-            )
+    existing = (
+        database.get_target_for_source(
+            source_channel_id
+        )
+    )
+
+    if existing is None:
+
+        logger.info(
+            "📝 Adding client: %s → %s",
+            source_channel_id,
+            target_channel_id,
         )
 
-        if existing is None:
-
-            logger.info(
-                "📝 Adding default client: "
-                "%s → %s",
-                SOURCE_CHANNEL_ID,
-                TARGET_CHANNEL_ID,
-            )
-
-            database.add_client(
-                SOURCE_CHANNEL_ID,
-                TARGET_CHANNEL_ID,
-            )
-
-        else:
-
-            logger.info(
-                "✅ Default client already registered: "
-                "%s → %s",
-                SOURCE_CHANNEL_ID,
-                existing,
-            )
-
-    except Exception:
-
-        logger.exception(
-            "❌ Failed to register default client."
+        database.add_client(
+            source_channel_id,
+            target_channel_id,
         )
 
-        raise
+    else:
+
+        logger.info(
+            "✅ Client already registered: "
+            "%s → %s",
+            source_channel_id,
+            existing,
+        )
 
     # --------------------------------------------------------
-    # Initialize processing position.
+    # START FROM NEWEST MESSAGE
     # --------------------------------------------------------
 
-    await initialize_last_processed()
+    for client in database.get_all_clients():
+
+        source = client["source"]
+
+        try:
+
+            channel = (
+                await user_client.get_entity(
+                    source
+                )
+            )
+
+            async for msg in user_client.iter_messages(
+                channel,
+                limit=1,
+            ):
+
+                last_processed[source] = (
+                    msg.id
+                )
+
+                logger.info(
+                    "📌 Last message in %s: %s",
+                    source,
+                    msg.id,
+                )
+
+                break
+
+        except Exception as e:
+
+            logger.exception(
+                "❌ Could not fetch last message "
+                "from %s: %s",
+                source,
+                e,
+            )
 
     # --------------------------------------------------------
-    # Start polling.
+    # POLLING
     # --------------------------------------------------------
 
     logger.info(
