@@ -3,24 +3,17 @@ import re
 import base64
 import time
 import asyncio
+import logging
 import subprocess
 import tempfile
-import logging
+
 from pathlib import Path
 from io import BytesIO
+from typing import Optional, Union
 
-from PIL import Image, ImageFile
+from PIL import Image
 from openai import OpenAI
 from aiogram.types import BufferedInputFile
-
-
-# ============================================================
-# PIL CONFIGURATION
-# ============================================================
-
-# Allow Pillow to handle slightly damaged/truncated Telegram
-# media instead of immediately rejecting it.
-ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 # ============================================================
@@ -29,20 +22,9 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 logger = logging.getLogger("ai_processor")
 
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    handler.setFormatter(
-        logging.Formatter(
-            "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-        )
-    )
-    logger.addHandler(handler)
-
-logger.setLevel(logging.INFO)
-
 
 # ============================================================
-# OPENAI
+# OPENAI CONFIGURATION
 # ============================================================
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
@@ -51,26 +33,29 @@ if not OPENAI_API_KEY:
     logger.error("❌ OPENAI_API_KEY is missing!")
 
 openai_client = OpenAI(
-    api_key=OPENAI_API_KEY
+    api_key=OPENAI_API_KEY,
 )
 
 
-# ============================================================
-# MODEL CONFIGURATION
-# ============================================================
-
-# Vision / analysis model.
+# Vision model used to analyze the original/contact sheet.
 #
-# Keep this configurable from Render so you can change it
-# without editing the source code.
-VISION_MODEL = os.getenv(
+# You can override this in Render:
+#
+# OPENAI_VISION_MODEL=gpt-4o-mini
+#
+OPENAI_VISION_MODEL = os.getenv(
     "OPENAI_VISION_MODEL",
     "gpt-4o-mini",
 ).strip()
 
 
-# Current OpenAI image-generation model.
-GENERATION_MODEL = os.getenv(
+# Image generation model.
+#
+# Current configuration:
+#
+# OPENAI_IMAGE_MODEL=gpt-image-2
+#
+OPENAI_IMAGE_MODEL = os.getenv(
     "OPENAI_IMAGE_MODEL",
     "gpt-image-2",
 ).strip()
@@ -90,6 +75,7 @@ NEW_MENTION = os.getenv(
     "",
 ).strip()
 
+
 if NEW_MENTION and not NEW_MENTION.startswith("@"):
     NEW_MENTION = "@" + NEW_MENTION
 
@@ -99,26 +85,53 @@ if NEW_MENTION and not NEW_MENTION.startswith("@"):
 # ============================================================
 
 _last_vision_call = 0.0
-_vision_cooldown = 3
+_vision_cooldown = float(
+    os.getenv(
+        "VISION_COOLDOWN",
+        "3",
+    )
+)
 
 _last_generation_call = 0.0
-_generation_cooldown = 3
+_generation_cooldown = float(
+    os.getenv(
+        "GENERATION_COOLDOWN",
+        "3",
+    )
+)
 
 
 # ============================================================
-# STARTUP
+# STARTUP LOG
 # ============================================================
 
 logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 logger.info("🤖 AI PROCESSOR STARTED")
-logger.info("👤 OLD_MENTION: %r", OLD_MENTION)
-logger.info("👤 NEW_MENTION: %r", NEW_MENTION)
-logger.info("🧠 Vision model: %s", VISION_MODEL)
-logger.info("🎨 Image model: %s", GENERATION_MODEL)
-logger.info("📝 Caption AI rewriting: DISABLED")
-logger.info("✏️ Caption processing: EXACT REPLACEMENT")
-logger.info("🖼️ Image pipeline: VISION → DECONSTRUCTION → GENERATION")
-logger.info("🎞️ MP4/GIF support: ENABLED")
+logger.info(
+    "👤 OLD_MENTION: %r",
+    OLD_MENTION,
+)
+logger.info(
+    "👤 NEW_MENTION: %r",
+    NEW_MENTION,
+)
+logger.info(
+    "🧠 Vision model: %s",
+    OPENAI_VISION_MODEL,
+)
+logger.info(
+    "🎨 Image model: %s",
+    OPENAI_IMAGE_MODEL,
+)
+logger.info(
+    "📝 Caption AI rewriting: DISABLED",
+)
+logger.info(
+    "✏️ Caption processing: EXACT REPLACEMENT",
+)
+logger.info(
+    "🖼️ Image pipeline: VISION → DECONSTRUCTION → GENERATION",
+)
 logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 
@@ -128,12 +141,15 @@ logger.info("━━━━━━━━━━━━━━━━━━━━━━�
 
 def replace_username(text: str) -> str:
     """
-    ONLY:
+    Process Telegram caption.
 
-    1. Remove literal '*'
-    2. Replace OLD_MENTION with NEW_MENTION
+    ONLY:
+        1. Remove literal '*'
+        2. Replace OLD_MENTION with NEW_MENTION
 
     No AI rewriting.
+    No paraphrasing.
+    No other text modification.
     """
 
     if not text:
@@ -143,7 +159,9 @@ def replace_username(text: str) -> str:
 
     if NEW_MENTION:
 
-        pattern = re.escape(OLD_MENTION)
+        pattern = re.escape(
+            OLD_MENTION
+        )
 
         result = re.sub(
             pattern,
@@ -155,7 +173,8 @@ def replace_username(text: str) -> str:
     else:
 
         logger.warning(
-            "⚠️ NEW_MENTION is empty. Username was not replaced."
+            "⚠️ NEW_MENTION is empty. "
+            "Username replacement skipped."
         )
 
     return result
@@ -164,90 +183,92 @@ def replace_username(text: str) -> str:
 async def rewrite_text(
     original_text: str,
 ) -> str:
+    """
+    Kept with the original function name so main.py
+    does not need to change.
 
-    result = replace_username(original_text)
+    This is NOT AI rewriting.
 
-    logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    logger.info("📝 CAPTION PROCESSING")
-    logger.info("📝 ORIGINAL: %r", original_text)
-    logger.info("📝 FINAL:    %r", result)
-    logger.info("👤 OLD:      %r", OLD_MENTION)
-    logger.info("👤 NEW:      %r", NEW_MENTION)
-    logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    Only:
+        remove '*'
+        replace OLD_MENTION
+    """
+
+    result = replace_username(
+        original_text
+    )
+
+    logger.info(
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    logger.info(
+        "📝 CAPTION PROCESSING"
+    )
+
+    logger.info(
+        "📝 ORIGINAL: %r",
+        original_text,
+    )
+
+    logger.info(
+        "📝 FINAL:    %r",
+        result,
+    )
+
+    logger.info(
+        "👤 OLD:      %r",
+        OLD_MENTION,
+    )
+
+    logger.info(
+        "👤 NEW:      %r",
+        NEW_MENTION,
+    )
+
+    logger.info(
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
 
     return result
 
 
 # ============================================================
-# MEDIA SIGNATURE DETECTION
-# ============================================================
-
-def get_media_signature(data: bytes) -> str:
-    if not data:
-        return "EMPTY"
-
-    return bytes(data[:32]).hex(" ")
-
-
-def _is_jpeg(data: bytes) -> bool:
-    return data.startswith(b"\xff\xd8\xff")
-
-
-def _is_png(data: bytes) -> bool:
-    return data.startswith(b"\x89PNG\r\n\x1a\n")
-
-
-def _is_gif(data: bytes) -> bool:
-    return data.startswith(b"GIF87a") or data.startswith(b"GIF89a")
-
-
-def _is_webp(data: bytes) -> bool:
-    return (
-        len(data) >= 12
-        and data[:4] == b"RIFF"
-        and data[8:12] == b"WEBP"
-    )
-
-
-def _is_video_container(data: bytes) -> bool:
-    """
-    Detect MP4/MOV and WebM/Matroska.
-
-    MP4 commonly starts with:
-
-        00 00 00 xx 66 74 79 70
-
-    Telegram GIFs frequently arrive this way.
-    """
-
-    if len(data) >= 12 and data[4:8] == b"ftyp":
-        return True
-
-    # WebM / Matroska EBML signature
-    if data.startswith(b"\x1a\x45\xdf\xa3"):
-        return True
-
-    return False
-
-
-# ============================================================
-# IMAGE RESIZE
+# IMAGE PREPARATION
 # ============================================================
 
 def resize_for_vision(
     img: Image.Image,
 ) -> Image.Image:
+    """
+    Resize while preserving aspect ratio.
+
+    Maximum dimension = 2048 px.
+    """
 
     max_dimension = 2048
 
     if max(img.size) <= max_dimension:
         return img
 
-    scale = max_dimension / max(img.size)
+    scale = (
+        max_dimension
+        / max(img.size)
+    )
 
     new_size = (
-        max(1, int(img.width * scale)),
-        max(1, int(img.height * scale)),
+        max(
+            1,
+            int(
+                img.width * scale
+            ),
+        ),
+        max(
+            1,
+            int(
+                img.height * scale
+            ),
+        ),
     )
 
     return img.resize(
@@ -256,92 +277,452 @@ def resize_for_vision(
     )
 
 
-# ============================================================
-# SAFE RGB CONVERSION
-# ============================================================
-
-def image_to_rgb(
-    source: Image.Image,
-) -> Image.Image:
-
+def _is_video_container(
+    data: bytes,
+) -> bool:
     """
-    Convert any Pillow image to RGB.
+    Detect MP4/MOV/WebM containers.
+    """
 
-    Handles:
-    - RGB
-    - RGBA
-    - palette transparency
-    - grayscale
-    - CMYK
+    if (
+        len(data) >= 12
+        and data[4:8] == b"ftyp"
+    ):
+        return True
+
+    return data.startswith(
+        b"\x1a\x45\xdf\xa3"
+    )
+
+
+# ============================================================
+# VIDEO / GIF CONTACT SHEET
+# ============================================================
+
+def _extract_video_contact_sheet(
+    video_bytes: bytes,
+):
+    """
+    Telegram GIFs are frequently delivered as MP4.
+
+    Extract representative frames using FFmpeg.
     """
 
     try:
 
-        if source.mode == "RGB":
-            return source.copy()
+        from imageio_ffmpeg import (
+            get_ffmpeg_exe,
+        )
 
-        if source.mode in ("RGBA", "LA"):
+    except ImportError:
 
-            rgba = source.convert("RGBA")
+        logger.error(
+            "❌ imageio-ffmpeg is missing. "
+            "Add imageio-ffmpeg to requirements.txt."
+        )
 
-            background = Image.new(
+        return None
+
+    try:
+
+        ffmpeg = get_ffmpeg_exe()
+
+        logger.info(
+            "🎞️ FFmpeg executable: %s",
+            ffmpeg,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+
+            input_path = (
+                Path(tmp)
+                / "telegram_media"
+            )
+
+            output_pattern = (
+                str(
+                    Path(tmp)
+                    / "frame_%02d.jpg"
+                )
+            )
+
+            input_path.write_bytes(
+                video_bytes
+            )
+
+            command = [
+                ffmpeg,
+                "-y",
+                "-i",
+                str(input_path),
+
+                # One frame every second.
+                "-vf",
+                (
+                    "fps=1/1,"
+                    "scale=1536:-2:"
+                    "force_original_aspect_ratio=decrease"
+                ),
+
+                "-frames:v",
+                "6",
+
+                "-q:v",
+                "2",
+
+                output_pattern,
+            ]
+
+            logger.info(
+                "🎞️ Running FFmpeg..."
+            )
+
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=90,
+            )
+
+            if result.returncode != 0:
+
+                stderr = (
+                    result.stderr
+                    .decode(
+                        "utf-8",
+                        errors="replace",
+                    )
+                )
+
+                logger.error(
+                    "❌ FFmpeg failed: %s",
+                    stderr[-3000:],
+                )
+
+                return None
+
+            frame_paths = sorted(
+                Path(tmp).glob(
+                    "frame_*.jpg"
+                )
+            )
+
+            if not frame_paths:
+
+                logger.error(
+                    "❌ FFmpeg produced no frames."
+                )
+
+                return None
+
+            logger.info(
+                "🎞️ FFmpeg produced %d frame(s).",
+                len(frame_paths),
+            )
+
+            frames = []
+
+            for frame_path in frame_paths:
+
+                try:
+
+                    with Image.open(
+                        frame_path
+                    ) as frame:
+
+                        prepared = (
+                            resize_for_vision(
+                                frame.convert(
+                                    "RGB"
+                                )
+                            )
+                        )
+
+                        frames.append(
+                            prepared.copy()
+                        )
+
+                except Exception:
+
+                    logger.exception(
+                        "⚠️ Could not read extracted frame %s",
+                        frame_path,
+                    )
+
+            if not frames:
+
+                logger.error(
+                    "❌ No decoded video frames."
+                )
+
+                return None
+
+            logger.info(
+                "🎞️ Successfully decoded %d frame(s).",
+                len(frames),
+            )
+
+            # ------------------------------------------------
+            # Build contact sheet.
+            # ------------------------------------------------
+
+            columns = min(
+                3,
+                len(frames),
+            )
+
+            rows = (
+                len(frames)
+                + columns
+                - 1
+            ) // columns
+
+            cell_width = max(
+                frame.width
+                for frame in frames
+            )
+
+            cell_height = max(
+                frame.height
+                for frame in frames
+            )
+
+            padding = 20
+
+            sheet = Image.new(
                 "RGB",
-                rgba.size,
+                (
+                    columns * cell_width
+                    + (columns + 1) * padding,
+
+                    rows * cell_height
+                    + (rows + 1) * padding,
+                ),
                 "white",
             )
 
-            background.paste(
-                rgba,
-                (0, 0),
-                rgba.getchannel("A"),
+            for index, frame in enumerate(
+                frames
+            ):
+
+                x = (
+                    padding
+                    + (
+                        index % columns
+                    )
+                    * (
+                        cell_width
+                        + padding
+                    )
+                )
+
+                y = (
+                    padding
+                    + (
+                        index // columns
+                    )
+                    * (
+                        cell_height
+                        + padding
+                    )
+                )
+
+                sheet.paste(
+                    frame,
+                    (
+                        x,
+                        y,
+                    ),
+                )
+
+            sheet = resize_for_vision(
+                sheet
             )
 
-            return background
-
-        if source.mode == "P":
-
-            rgba = source.convert("RGBA")
-
-            background = Image.new(
-                "RGB",
-                rgba.size,
-                "white",
+            logger.info(
+                "✅ Video/GIF contact sheet created: %sx%s",
+                sheet.width,
+                sheet.height,
             )
 
-            background.paste(
-                rgba,
-                (0, 0),
-                rgba.getchannel("A"),
-            )
+            return sheet
 
-            return background
+    except subprocess.TimeoutExpired:
 
-        return source.convert("RGB")
+        logger.error(
+            "❌ FFmpeg timed out."
+        )
+
+        return None
 
     except Exception:
 
         logger.exception(
-            "❌ RGB conversion failed."
+            "❌ VIDEO/GIF FRAME EXTRACTION FAILED"
         )
 
-        return source.convert("RGB")
+        return None
 
 
 # ============================================================
-# CONTACT SHEET
+# PIL IMAGE / GIF CONTACT SHEET
 # ============================================================
 
-def create_contact_sheet(
-    frames,
-) -> Image.Image:
+def _prepare_pillow_media(
+    image_bytes: bytes,
+):
+    """
+    Prepare normal image or animated GIF.
+    """
+
+    source = Image.open(
+        BytesIO(image_bytes)
+    )
+
+    source.load()
+
+    is_animated = bool(
+        getattr(
+            source,
+            "is_animated",
+            False,
+        )
+    )
+
+    # --------------------------------------------------------
+    # Normal image.
+    # --------------------------------------------------------
+
+    if not is_animated:
+
+        rgba = source.convert(
+            "RGBA"
+        )
+
+        background = Image.new(
+            "RGB",
+            rgba.size,
+            "white",
+        )
+
+        background.paste(
+            rgba,
+            (0, 0),
+            rgba.getchannel(
+                "A"
+            ),
+        )
+
+        return resize_for_vision(
+            background
+        )
+
+    # --------------------------------------------------------
+    # Animated GIF.
+    # --------------------------------------------------------
+
+    total_frames = int(
+        getattr(
+            source,
+            "n_frames",
+            1,
+        )
+    )
+
+    sample_count = min(
+        6,
+        total_frames,
+    )
+
+    if sample_count <= 1:
+
+        frame_indexes = [0]
+
+    else:
+
+        frame_indexes = [
+            round(
+                i
+                * (
+                    total_frames
+                    - 1
+                )
+                / (
+                    sample_count
+                    - 1
+                )
+            )
+            for i in range(
+                sample_count
+            )
+        ]
+
+    frames = []
+
+    for frame_number in frame_indexes:
+
+        try:
+
+            source.seek(
+                frame_number
+            )
+
+            rgba = source.convert(
+                "RGBA"
+            )
+
+            background = Image.new(
+                "RGB",
+                rgba.size,
+                "white",
+            )
+
+            background.paste(
+                rgba,
+                (0, 0),
+                rgba.getchannel(
+                    "A"
+                ),
+            )
+
+            frames.append(
+                resize_for_vision(
+                    background
+                ).copy()
+            )
+
+        except Exception:
+
+            logger.exception(
+                "⚠️ Could not read GIF frame %s",
+                frame_number,
+            )
 
     if not frames:
-        raise ValueError(
-            "No frames supplied to contact sheet."
+
+        logger.error(
+            "❌ No GIF frames could be extracted."
         )
 
-    columns = min(3, len(frames))
-    rows = (len(frames) + columns - 1) // columns
+        return None
+
+    logger.info(
+        "🎞️ Animated GIF detected: "
+        "%d total frames; using %d representative frames.",
+        total_frames,
+        len(frames),
+    )
+
+    columns = min(
+        3,
+        len(frames),
+    )
+
+    rows = (
+        len(frames)
+        + columns
+        - 1
+    ) // columns
 
     cell_width = max(
         frame.width
@@ -367,356 +748,64 @@ def create_contact_sheet(
         "white",
     )
 
-    for index, frame in enumerate(frames):
+    for index, frame in enumerate(
+        frames
+    ):
 
         x = (
             padding
-            + (index % columns)
-            * (cell_width + padding)
+            + (
+                index % columns
+            )
+            * (
+                cell_width
+                + padding
+            )
         )
 
         y = (
             padding
-            + (index // columns)
-            * (cell_height + padding)
+            + (
+                index // columns
+            )
+            * (
+                cell_height
+                + padding
+            )
         )
 
         sheet.paste(
             frame,
-            (x, y),
+            (
+                x,
+                y,
+            ),
         )
 
-    return resize_for_vision(sheet)
-
-
-# ============================================================
-# MP4 / VIDEO FRAME EXTRACTION
-# ============================================================
-
-def _extract_video_contact_sheet(
-    video_bytes: bytes,
-):
-
-    logger.info(
-        "🎞️ Preparing video/GIF media with FFmpeg..."
+    return resize_for_vision(
+        sheet
     )
 
-    try:
-
-        from imageio_ffmpeg import get_ffmpeg_exe
-
-    except ImportError:
-
-        logger.exception(
-            "❌ imageio-ffmpeg is not installed."
-        )
-
-        return None
-
-    try:
-
-        ffmpeg = get_ffmpeg_exe()
-
-        logger.info(
-            "🎞️ FFmpeg executable: %s",
-            ffmpeg,
-        )
-
-        with tempfile.TemporaryDirectory() as tmp:
-
-            tmp_path = Path(tmp)
-
-            input_path = (
-                tmp_path
-                / "telegram_media.mp4"
-            )
-
-            output_pattern = str(
-                tmp_path
-                / "frame_%02d.jpg"
-            )
-
-            input_path.write_bytes(
-                video_bytes
-            )
-
-            logger.info(
-                "🎞️ Temporary video size: %d bytes",
-                len(video_bytes),
-            )
-
-            command = [
-                ffmpeg,
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-i",
-                str(input_path),
-
-                # Sample approximately 6 frames.
-                "-vf",
-                (
-                    "fps=1/1,"
-                    "scale=1536:1536:"
-                    "force_original_aspect_ratio=decrease"
-                ),
-
-                "-frames:v",
-                "6",
-
-                "-q:v",
-                "2",
-
-                output_pattern,
-            ]
-
-            logger.info(
-                "🎞️ Running FFmpeg..."
-            )
-
-            result = subprocess.run(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=90,
-            )
-
-            stderr_text = result.stderr.decode(
-                "utf-8",
-                errors="replace",
-            )
-
-            if result.returncode != 0:
-
-                logger.error(
-                    "❌ FFmpeg failed. Exit code=%s",
-                    result.returncode,
-                )
-
-                logger.error(
-                    "❌ FFmpeg stderr:\n%s",
-                    stderr_text[-5000:],
-                )
-
-                return None
-
-            frame_paths = sorted(
-                tmp_path.glob("frame_*.jpg")
-            )
-
-            if not frame_paths:
-
-                logger.error(
-                    "❌ FFmpeg completed but produced no frames."
-                )
-
-                if stderr_text:
-                    logger.error(
-                        "FFmpeg output:\n%s",
-                        stderr_text[-3000:],
-                    )
-
-                return None
-
-            logger.info(
-                "🎞️ FFmpeg produced %d frame(s).",
-                len(frame_paths),
-            )
-
-            frames = []
-
-            for frame_path in frame_paths:
-
-                try:
-
-                    with Image.open(
-                        frame_path
-                    ) as frame:
-
-                        frame.load()
-
-                        rgb = image_to_rgb(
-                            frame
-                        )
-
-                        rgb = resize_for_vision(
-                            rgb
-                        )
-
-                        frames.append(
-                            rgb.copy()
-                        )
-
-                except Exception:
-
-                    logger.exception(
-                        "⚠️ Failed reading extracted frame: %s",
-                        frame_path,
-                    )
-
-            if not frames:
-
-                logger.error(
-                    "❌ No extracted frames could be opened."
-                )
-
-                return None
-
-            logger.info(
-                "🎞️ Successfully decoded %d frame(s).",
-                len(frames),
-            )
-
-            sheet = create_contact_sheet(
-                frames
-            )
-
-            logger.info(
-                "✅ Video/GIF contact sheet created: %sx%s",
-                sheet.width,
-                sheet.height,
-            )
-
-            return sheet
-
-    except subprocess.TimeoutExpired:
-
-        logger.exception(
-            "❌ FFmpeg timed out after 90 seconds."
-        )
-
-        return None
-
-    except Exception:
-
-        logger.exception(
-            "❌ VIDEO/GIF FRAME EXTRACTION FAILED"
-        )
-
-        return None
-
 
 # ============================================================
-# GIF FRAME EXTRACTION
-# ============================================================
-
-def _extract_gif_contact_sheet(
-    source: Image.Image,
-):
-
-    try:
-
-        total_frames = int(
-            getattr(
-                source,
-                "n_frames",
-                1,
-            )
-        )
-
-        sample_count = min(
-            6,
-            total_frames,
-        )
-
-        if sample_count <= 1:
-
-            frame_indexes = [0]
-
-        else:
-
-            frame_indexes = [
-                round(
-                    i
-                    * (total_frames - 1)
-                    / (sample_count - 1)
-                )
-                for i in range(
-                    sample_count
-                )
-            ]
-
-        frames = []
-
-        for frame_number in frame_indexes:
-
-            try:
-
-                source.seek(
-                    frame_number
-                )
-
-                source.load()
-
-                frame = image_to_rgb(
-                    source
-                )
-
-                frame = resize_for_vision(
-                    frame
-                )
-
-                frames.append(
-                    frame.copy()
-                )
-
-            except Exception:
-
-                logger.exception(
-                    "⚠️ Could not read GIF frame %s",
-                    frame_number,
-                )
-
-        if not frames:
-
-            logger.error(
-                "❌ No GIF frames could be extracted."
-            )
-
-            return None
-
-        logger.info(
-            "🎞️ Animated GIF detected: "
-            "%d total frame(s); using %d.",
-            total_frames,
-            len(frames),
-        )
-
-        return create_contact_sheet(
-            frames
-        )
-
-    except Exception:
-
-        logger.exception(
-            "❌ GIF frame extraction failed."
-        )
-
-        return None
-
-
-# ============================================================
-# IMAGE PREPARATION
+# PREPARE MEDIA FOR VISION
 # ============================================================
 
 def prepare_image_for_vision(
     image_bytes: bytes,
 ):
-
     """
-    Convert Telegram media into a clean JPEG-compatible
-    image for Vision.
+    Prepare:
+        PNG
+        JPG
+        JPEG
+        WEBP
+        GIF
+        MP4
+        MOV
+        WEBM
 
-    Supported:
-
-    JPEG
-    PNG
-    GIF
-    WebP
-    MP4/MOV
-    WebM
-    Telegram GIF-as-MP4
+    into a JPEG image suitable for Vision.
     """
 
     if not image_bytes:
@@ -729,7 +818,9 @@ def prepare_image_for_vision(
 
     logger.info(
         "🔬 Media signature: %s",
-        get_media_signature(image_bytes),
+        bytes(
+            image_bytes[:32]
+        ).hex(" "),
     )
 
     logger.info(
@@ -740,7 +831,7 @@ def prepare_image_for_vision(
     try:
 
         # ----------------------------------------------------
-        # VIDEO / TELEGRAM GIF
+        # Video / MP4 GIF.
         # ----------------------------------------------------
 
         if _is_video_container(
@@ -751,70 +842,21 @@ def prepare_image_for_vision(
                 "🎞️ MP4/MOV/WebM container detected."
             )
 
+            logger.info(
+                "🎞️ Preparing video/GIF media with FFmpeg..."
+            )
+
             return _extract_video_contact_sheet(
                 image_bytes
             )
 
         # ----------------------------------------------------
-        # NORMAL IMAGE
+        # Pillow image/GIF.
         # ----------------------------------------------------
 
-        logger.info(
-            "🖼️ Attempting to decode media with Pillow..."
+        return _prepare_pillow_media(
+            image_bytes
         )
-
-        source = Image.open(
-            BytesIO(image_bytes)
-        )
-
-        logger.info(
-            "🖼️ Pillow detected format=%s mode=%s size=%s",
-            source.format,
-            source.mode,
-            source.size,
-        )
-
-        source.load()
-
-        # ----------------------------------------------------
-        # ANIMATED GIF
-        # ----------------------------------------------------
-
-        if bool(
-            getattr(
-                source,
-                "is_animated",
-                False,
-            )
-        ):
-
-            logger.info(
-                "🎞️ Pillow detected animated media."
-            )
-
-            return _extract_gif_contact_sheet(
-                source
-            )
-
-        # ----------------------------------------------------
-        # STATIC IMAGE
-        # ----------------------------------------------------
-
-        rgb = image_to_rgb(
-            source
-        )
-
-        rgb = resize_for_vision(
-            rgb
-        )
-
-        logger.info(
-            "✅ Static image prepared: %sx%s",
-            rgb.width,
-            rgb.height,
-        )
-
-        return rgb
 
     except Exception:
 
@@ -826,120 +868,16 @@ def prepare_image_for_vision(
 
 
 # ============================================================
-# VISION REQUEST
+# VISION PROMPT
 # ============================================================
 
-async def describe_image_bytes(
-    image_bytes: bytes,
-):
-
-    global _last_vision_call
-
-    if not image_bytes:
-
-        logger.error(
-            "❌ Vision received empty image bytes."
-        )
-
-        return None
-
-    # --------------------------------------------------------
-    # COOLDOWN
-    # --------------------------------------------------------
-
-    elapsed = (
-        time.time()
-        - _last_vision_call
-    )
-
-    if elapsed < _vision_cooldown:
-
-        wait = (
-            _vision_cooldown
-            - elapsed
-        )
-
-        logger.info(
-            "⏳ Vision cooldown: %.2fs",
-            wait,
-        )
-
-        await asyncio.sleep(
-            wait
-        )
-
-    _last_vision_call = time.time()
-
-    # --------------------------------------------------------
-    # PREPARE
-    # --------------------------------------------------------
-
-    logger.info(
-        "🖼️ Preparing original media for Vision..."
-    )
-
-    image = prepare_image_for_vision(
-        image_bytes
-    )
-
-    if image is None:
-
-        logger.error(
-            "❌ Vision image preparation returned None."
-        )
-
-        return None
-
-    # --------------------------------------------------------
-    # JPEG ENCODE
-    # --------------------------------------------------------
-
-    try:
-
-        buffer = BytesIO()
-
-        image.save(
-            buffer,
-            format="JPEG",
-            quality=92,
-            optimize=True,
-        )
-
-        jpeg_bytes = buffer.getvalue()
-
-        logger.info(
-            "✅ Vision JPEG prepared: %d bytes",
-            len(jpeg_bytes),
-        )
-
-        encoded = base64.b64encode(
-            jpeg_bytes
-        ).decode("ascii")
-
-        image_data_url = (
-            "data:image/jpeg;base64,"
-            + encoded
-        )
-
-    except Exception:
-
-        logger.exception(
-            "❌ Failed to encode Vision image."
-        )
-
-        return None
-
-    # ========================================================
-    # VISION PROMPT
-    # ========================================================
-
-    prompt = """
+VISION_PROMPT = """
 Analyze this image carefully and create a detailed
 reconstruction specification for a NEW image.
 
 The purpose is to understand the visual design and legitimate
-content so another image-generation model can create a new
-similar graphic.
+visible content so another image-generation model can create a
+new graphic.
 
 IMPORTANT:
 
@@ -954,7 +892,7 @@ Do NOT reproduce:
 
 Describe those areas generically instead.
 
-Do NOT include the actual watermark or username in your
+Do NOT include the actual watermark or username in the
 reconstruction specification.
 
 ============================================================
@@ -964,8 +902,8 @@ reconstruction specification.
 Describe:
 - orientation
 - approximate aspect ratio
-- layout dimensions
 - overall proportions
+- major dimensions
 
 ============================================================
 2. MAIN CONTENT
@@ -1043,7 +981,7 @@ Describe:
 - outlines
 - shadows
 - glow
-- spacing
+- letter spacing
 
 ============================================================
 6. COLORS
@@ -1091,7 +1029,7 @@ Describe legitimate:
 9. ANIMATION
 ============================================================
 
-If this is a contact sheet from a GIF/video:
+If this is a contact sheet from an animated GIF/video:
 
 Describe:
 - what changes between frames
@@ -1105,8 +1043,8 @@ Describe:
 10. FINAL GENERATION SPECIFICATION
 ============================================================
 
-Finish with a detailed specification that another image
-generator can use to create a NEW image with:
+Finish with a detailed specification another image generator
+can use to create a NEW image with:
 
 - similar composition
 - similar hierarchy
@@ -1121,9 +1059,155 @@ channel branding and third-party logos.
 Do not invent information.
 """
 
-    # ========================================================
-    # VISION REQUEST
-    # ========================================================
+
+# ============================================================
+# VISION REQUEST
+# ============================================================
+
+async def describe_image_bytes(
+    image_bytes: bytes,
+):
+    """
+    Send prepared image to OpenAI Vision.
+
+    Uses the current Responses API.
+    """
+
+    global _last_vision_call
+
+    if not image_bytes:
+
+        logger.error(
+            "❌ Vision received empty image bytes."
+        )
+
+        return None
+
+    # --------------------------------------------------------
+    # Cooldown.
+    # --------------------------------------------------------
+
+    elapsed = (
+        time.time()
+        - _last_vision_call
+    )
+
+    if elapsed < _vision_cooldown:
+
+        wait = (
+            _vision_cooldown
+            - elapsed
+        )
+
+        logger.info(
+            "⏳ Vision cooldown: %.2fs",
+            wait,
+        )
+
+        await asyncio.sleep(
+            wait
+        )
+
+    # --------------------------------------------------------
+    # Prepare media.
+    # --------------------------------------------------------
+
+    try:
+
+        image = prepare_image_for_vision(
+            image_bytes
+        )
+
+        if image is None:
+
+            logger.error(
+                "❌ Could not prepare media for Vision."
+            )
+
+            return None
+
+        buffer = BytesIO()
+
+        image.save(
+            buffer,
+            format="JPEG",
+            quality=92,
+            optimize=True,
+        )
+
+        jpeg_bytes = (
+            buffer.getvalue()
+        )
+
+        encoded = base64.b64encode(
+            jpeg_bytes
+        ).decode(
+            "utf-8"
+        )
+
+        image_url = (
+            "data:image/jpeg;base64,"
+            + encoded
+        )
+
+        logger.info(
+            "✅ Vision JPEG prepared: %d bytes",
+            len(jpeg_bytes),
+        )
+
+    except Exception:
+
+        logger.exception(
+            "❌ Failed to prepare Vision image."
+        )
+
+        return None
+
+    # --------------------------------------------------------
+    # Ensure SDK supports Responses API.
+    # --------------------------------------------------------
+
+    responses_api = getattr(
+        openai_client,
+        "responses",
+        None,
+    )
+
+    if responses_api is None:
+
+        logger.error(
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
+
+        logger.error(
+            "❌ OPENAI SDK DOES NOT SUPPORT RESPONSES API"
+        )
+
+        logger.error(
+            "❌ Installed OpenAI SDK is too old or incompatible."
+        )
+
+        logger.error(
+            "❌ Upgrade with: pip install -U openai"
+        )
+
+        logger.error(
+            "❌ Add/update requirements.txt with:"
+        )
+
+        logger.error(
+            "❌ openai>=1.100.0"
+        )
+
+        logger.error(
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
+
+        return None
+
+    # --------------------------------------------------------
+    # Retry.
+    # --------------------------------------------------------
 
     max_retries = 3
 
@@ -1139,34 +1223,33 @@ Do not invent information.
                 max_retries,
             )
 
-            # ------------------------------------------------
-            # Use Responses API.
-            #
-            # This avoids the older chat-completions image
-            # request path and is the current OpenAI API style.
-            # ------------------------------------------------
+            _last_vision_call = time.time()
 
-            response = (
-                openai_client.responses.create(
-                    model=VISION_MODEL,
+            def make_request():
 
+                return openai_client.responses.create(
+                    model=OPENAI_VISION_MODEL,
                     input=[
                         {
                             "role": "user",
                             "content": [
                                 {
                                     "type": "input_text",
-                                    "text": prompt,
+                                    "text": VISION_PROMPT,
                                 },
                                 {
                                     "type": "input_image",
-                                    "image_url": image_data_url,
+                                    "image_url": image_url,
                                     "detail": "high",
                                 },
                             ],
                         }
                     ],
+                    max_output_tokens=4000,
                 )
+
+            response = await asyncio.to_thread(
+                make_request
             )
 
             description = getattr(
@@ -1178,12 +1261,12 @@ Do not invent information.
             if not description:
 
                 logger.error(
-                    "❌ Vision returned empty output."
+                    "❌ Vision returned empty output_text."
                 )
 
                 logger.error(
-                    "❌ Raw response: %r",
-                    response,
+                    "❌ Response type: %s",
+                    type(response).__name__,
                 )
 
                 return None
@@ -1196,8 +1279,12 @@ Do not invent information.
             )
 
             logger.info(
-                "🧩 Vision preview:\n%s",
-                description[:2000],
+                "🧩 Vision preview:"
+            )
+
+            logger.info(
+                "%s",
+                description[:1200],
             )
 
             return description
@@ -1207,6 +1294,12 @@ Do not invent information.
             status_code = getattr(
                 e,
                 "status_code",
+                None,
+            )
+
+            error_code = getattr(
+                e,
+                "code",
                 None,
             )
 
@@ -1233,6 +1326,11 @@ Do not invent information.
                 status_code,
             )
 
+            logger.error(
+                "❌ Code: %s",
+                error_code,
+            )
+
             body = getattr(
                 e,
                 "body",
@@ -1242,39 +1340,25 @@ Do not invent information.
             if body:
 
                 logger.error(
-                    "❌ API ERROR BODY: %r",
+                    "❌ API BODY: %s",
                     body,
-                )
-
-            response_obj = getattr(
-                e,
-                "response",
-                None,
-            )
-
-            if response_obj:
-
-                logger.error(
-                    "❌ API RESPONSE: %r",
-                    response_obj,
                 )
 
             logger.error(
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             )
 
-            # ------------------------------------------------
-            # Retry rate limits / temporary errors.
-            # ------------------------------------------------
+            # Retry rate limits / temporary server errors.
+            retryable = (
+                status_code == 429
+                or (
+                    status_code is not None
+                    and status_code >= 500
+                )
+            )
 
             if (
-                status_code in (
-                    429,
-                    500,
-                    502,
-                    503,
-                    504,
-                )
+                retryable
                 and attempt < max_retries - 1
             ):
 
@@ -1297,55 +1381,14 @@ Do not invent information.
 
 
 # ============================================================
-# IMAGE GENERATION
+# IMAGE GENERATION PROMPT
 # ============================================================
 
-async def generate_image_from_description(
+def build_generation_prompt(
     description: str,
-):
+) -> str:
 
-    global _last_generation_call
-
-    if not description:
-
-        logger.error(
-            "❌ Empty reconstruction description."
-        )
-
-        return None
-
-    # --------------------------------------------------------
-    # COOLDOWN
-    # --------------------------------------------------------
-
-    elapsed = (
-        time.time()
-        - _last_generation_call
-    )
-
-    if elapsed < _generation_cooldown:
-
-        wait = (
-            _generation_cooldown
-            - elapsed
-        )
-
-        logger.info(
-            "⏳ Image generation cooldown: %.2fs",
-            wait,
-        )
-
-        await asyncio.sleep(
-            wait
-        )
-
-    _last_generation_call = time.time()
-
-    # ========================================================
-    # GENERATION PROMPT
-    # ========================================================
-
-    generation_prompt = f"""
+    return f"""
 Create a NEW professional sports graphic using the
 reconstruction specification below.
 
@@ -1356,7 +1399,6 @@ DESIGN
 ============================================================
 
 Preserve the described:
-
 - composition
 - hierarchy
 - spacing
@@ -1370,10 +1412,10 @@ Preserve the described:
 TEXT
 ============================================================
 
-Make legitimate text as accurate and readable as possible.
+Make legitimate visible text as accurate and readable as
+possible.
 
 Do not invent:
-
 - scores
 - odds
 - dates
@@ -1382,15 +1424,14 @@ Do not invent:
 - picks
 - numbers
 
-Only reproduce legitimate information that is actually
-contained in the reconstruction specification.
+Only use information supported by the reconstruction
+specification.
 
 ============================================================
 EXCLUDE
 ============================================================
 
 Do NOT include:
-
 - watermarks
 - usernames
 - @handles
@@ -1399,16 +1440,15 @@ Do NOT include:
 - third-party logos
 - third-party brand marks
 
-Any area that previously contained such material should
-become a clean part of the new design.
+Any area that previously contained such material should become
+a clean, neutral part of the new design.
 
 ============================================================
 QUALITY
 ============================================================
 
 Create:
-
-- sharp text
+- sharp readable text
 - professional typography
 - clean spacing
 - strong hierarchy
@@ -1424,264 +1464,256 @@ RECONSTRUCTION SPECIFICATION
 {description}
 """
 
-    # ========================================================
-    # GENERATION REQUEST
-    # ========================================================
 
-    max_retries = 2
+# ============================================================
+# IMAGE GENERATION
+# ============================================================
 
-    for attempt in range(
-        max_retries
-    ):
+async def generate_image_from_description(
+    description: str,
+):
+    """
+    Generate a NEW image from the Vision reconstruction
+    specification.
+    """
 
-        try:
+    global _last_generation_call
 
-            logger.info(
-                "🎨 OpenAI image generation request %d/%d",
-                attempt + 1,
-                max_retries,
+    if not description:
+
+        logger.error(
+            "❌ Empty reconstruction description."
+        )
+
+        return None
+
+    # --------------------------------------------------------
+    # Cooldown.
+    # --------------------------------------------------------
+
+    elapsed = (
+        time.time()
+        - _last_generation_call
+    )
+
+    if elapsed < _generation_cooldown:
+
+        wait = (
+            _generation_cooldown
+            - elapsed
+        )
+
+        logger.info(
+            "⏳ Generation cooldown: %.2fs",
+            wait,
+        )
+
+        await asyncio.sleep(
+            wait
+        )
+
+    _last_generation_call = time.time()
+
+    generation_prompt = (
+        build_generation_prompt(
+            description
+        )
+    )
+
+    logger.info(
+        "🎨 Sending reconstruction "
+        "specification to image generation..."
+    )
+
+    logger.info(
+        "📝 Generation prompt length: %d characters",
+        len(generation_prompt),
+    )
+
+    # --------------------------------------------------------
+    # Request.
+    # --------------------------------------------------------
+
+    try:
+
+        def make_request():
+
+            return openai_client.images.generate(
+                model=OPENAI_IMAGE_MODEL,
+                prompt=generation_prompt,
+                n=1,
             )
 
-            logger.info(
-                "🎨 Image model: %s",
-                GENERATION_MODEL,
-            )
+        response = await asyncio.to_thread(
+            make_request
+        )
 
-            logger.info(
-                "📝 Generation prompt length: %d characters",
-                len(generation_prompt),
-            )
-
-            response = (
-                openai_client.images.generate(
-                    model=GENERATION_MODEL,
-                    prompt=generation_prompt,
-                    n=1,
-                )
-            )
-
-            if not response:
-
-                logger.error(
-                    "❌ OpenAI returned no image response."
-                )
-
-                return None
-
-            if not response.data:
-
-                logger.error(
-                    "❌ OpenAI returned no image data."
-                )
-
-                return None
-
-            image_data = response.data[0]
-
-            # ------------------------------------------------
-            # BASE64
-            # ------------------------------------------------
-
-            b64_json = getattr(
-                image_data,
-                "b64_json",
-                None,
-            )
-
-            if b64_json:
-
-                try:
-
-                    image_bytes = base64.b64decode(
-                        b64_json
-                    )
-
-                except Exception:
-
-                    logger.exception(
-                        "❌ Failed to decode generated image."
-                    )
-
-                    return None
-
-                if not image_bytes:
-
-                    logger.error(
-                        "❌ Generated image bytes are empty."
-                    )
-
-                    return None
-
-                logger.info(
-                    "✅ NEW IMAGE GENERATED (%d bytes)",
-                    len(image_bytes),
-                )
-
-                return BufferedInputFile(
-                    file=image_bytes,
-                    filename="regenerated.png",
-                )
-
-            # ------------------------------------------------
-            # URL
-            # ------------------------------------------------
-
-            image_url = getattr(
-                image_data,
-                "url",
-                None,
-            )
-
-            if image_url:
-
-                logger.info(
-                    "✅ NEW IMAGE GENERATED as URL."
-                )
-
-                return image_url
+        if not response:
 
             logger.error(
-                "❌ OpenAI response contained neither "
-                "b64_json nor URL."
-            )
-
-            logger.error(
-                "❌ Image response object: %r",
-                image_data,
+                "❌ OpenAI returned no image response."
             )
 
             return None
 
-        except Exception as e:
+        data = getattr(
+            response,
+            "data",
+            None,
+        )
 
-            status_code = getattr(
+        if not data:
+
+            logger.error(
+                "❌ OpenAI returned no image data."
+            )
+
+            return None
+
+        image_data = data[0]
+
+        # ----------------------------------------------------
+        # Base64 response.
+        # ----------------------------------------------------
+
+        b64_json = getattr(
+            image_data,
+            "b64_json",
+            None,
+        )
+
+        if b64_json:
+
+            image_bytes = base64.b64decode(
+                b64_json
+            )
+
+            logger.info(
+                "✅ NEW IMAGE GENERATED (%d bytes)",
+                len(image_bytes),
+            )
+
+            return BufferedInputFile(
+                file=image_bytes,
+                filename="regenerated.png",
+            )
+
+        # ----------------------------------------------------
+        # URL response.
+        # ----------------------------------------------------
+
+        image_url = getattr(
+            image_data,
+            "url",
+            None,
+        )
+
+        if image_url:
+
+            logger.info(
+                "✅ NEW IMAGE GENERATED as URL."
+            )
+
+            return image_url
+
+        logger.error(
+            "❌ Image response contained neither "
+            "b64_json nor URL."
+        )
+
+        logger.error(
+            "❌ Image response object: %r",
+            image_data,
+        )
+
+        return None
+
+    except Exception as e:
+
+        logger.error(
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
+
+        logger.error(
+            "❌ OPENAI IMAGE GENERATION ERROR"
+        )
+
+        logger.error(
+            "❌ Exception type: %s",
+            type(e).__name__,
+        )
+
+        logger.error(
+            "❌ Exception: %s",
+            str(e),
+        )
+
+        logger.error(
+            "❌ Status code: %s",
+            getattr(
                 e,
                 "status_code",
                 None,
-            )
+            ),
+        )
 
-            logger.error(
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            )
-
-            logger.error(
-                "❌ OPENAI IMAGE GENERATION ERROR"
-            )
-
-            logger.error(
-                "❌ Exception type: %s",
-                type(e).__name__,
-            )
-
-            logger.error(
-                "❌ Exception: %s",
-                str(e),
-            )
-
-            logger.error(
-                "❌ Status code: %s",
-                status_code,
-            )
-
-            logger.error(
-                "❌ Error code: %s",
-                getattr(
-                    e,
-                    "code",
-                    None,
-                ),
-            )
-
-            logger.error(
-                "❌ Parameter: %s",
-                getattr(
-                    e,
-                    "param",
-                    None,
-                ),
-            )
-
-            body = getattr(
+        logger.error(
+            "❌ Error code: %s",
+            getattr(
                 e,
-                "body",
+                "code",
                 None,
-            )
+            ),
+        )
 
-            if body:
-
-                logger.error(
-                    "❌ API ERROR BODY: %r",
-                    body,
-                )
-
-            response_obj = getattr(
+        logger.error(
+            "❌ Parameter: %s",
+            getattr(
                 e,
-                "response",
+                "param",
                 None,
-            )
+            ),
+        )
 
-            if response_obj:
+        body = getattr(
+            e,
+            "body",
+            None,
+        )
 
-                logger.error(
-                    "❌ API RESPONSE: %r",
-                    response_obj,
-                )
+        if body:
 
             logger.error(
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                "❌ API ERROR BODY: %s",
+                body,
             )
 
-            if (
-                status_code in (
-                    429,
-                    500,
-                    502,
-                    503,
-                    504,
-                )
-                and attempt < max_retries - 1
-            ):
+        logger.error(
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
 
-                wait = 2 ** attempt
-
-                logger.warning(
-                    "⏳ Retrying image generation in %ds...",
-                    wait,
-                )
-
-                await asyncio.sleep(
-                    wait
-                )
-
-                continue
-
-            return None
-
-    return None
+        return None
 
 
 # ============================================================
-# COMPLETE REGENERATION PIPELINE
+# COMPLETE IMAGE REGENERATION PIPELINE
 # ============================================================
 
 async def regenerate_image_from_bytes(
     image_bytes: bytes,
 ):
-
     """
     Complete pipeline:
 
-        Telegram image/GIF/video
+        Telegram image/GIF
                 ↓
-        Detect media
-                ↓
-        Convert to JPEG/contact sheet
+        Prepare media
                 ↓
         OpenAI Vision
                 ↓
         Deconstruction
                 ↓
-        OpenAI Image Generation
+        OpenAI image generation
                 ↓
         NEW IMAGE
     """
@@ -1710,7 +1742,9 @@ async def regenerate_image_from_bytes(
 
     logger.info(
         "🔬 Original signature: %s",
-        get_media_signature(image_bytes),
+        bytes(
+            image_bytes[:32]
+        ).hex(" "),
     )
 
     logger.info(
@@ -1748,7 +1782,8 @@ async def regenerate_image_from_bytes(
         )
 
         logger.error(
-            "❌ No reconstruction specification was returned."
+            "❌ No reconstruction specification "
+            "was returned."
         )
 
         return None
@@ -1792,10 +1827,6 @@ async def regenerate_image_from_bytes(
         )
 
         return None
-
-    logger.info(
-        "✅ STEP 2 COMPLETE"
-    )
 
     logger.info(
         "✅ NEW IMAGE CREATED"
