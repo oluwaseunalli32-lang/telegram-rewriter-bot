@@ -1,999 +1,782 @@
 import os
+import re
 import io
-import cv2
 import time
+import asyncio
 import logging
-import tempfile
 import subprocess
-
-import numpy as np
-
+import tempfile
 from pathlib import Path
+
+import cv2
+import numpy as np
+import pytesseract
+
 from PIL import Image, ImageSequence
+from aiogram.types import BufferedInputFile
 
 
 # ============================================================
 # LOGGING
 # ============================================================
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("ai_processor")
 
 
 # ============================================================
-# PATHS
+# CAPTION CONFIGURATION
 # ============================================================
 
-BASE_DIR = Path(__file__).resolve().parent
+OLD_MENTION = os.getenv(
+    "OLD_MENTION",
+    "@cappersfree",
+).strip()
 
-WATERMARK_DIR = (
-    BASE_DIR
-    / "assets"
-    / "watermarks"
-)
+NEW_MENTION = os.getenv(
+    "NEW_MENTION",
+    "",
+).strip()
+
+if NEW_MENTION and not NEW_MENTION.startswith("@"):
+    NEW_MENTION = "@" + NEW_MENTION
 
 
 # ============================================================
-# WATERMARK SETTINGS
+# WATERMARK CONFIGURATION
 # ============================================================
 
-# Example project structure:
+WATERMARK_TEXT = "cappersfree"
+
+# Conservative settings.
 #
-# assets/
-#   watermarks/
-#       cf_logo.png
-#       cappersfree.png
-#
-# You can put additional watermark templates here too.
-#
-# IMPORTANT:
-# Transparent PNG templates are strongly recommended.
+# The processor tries to detect the watermark automatically.
+# It does NOT use a hard-coded coordinate.
 
-IMAGE_MATCH_THRESHOLD = float(
-    os.getenv(
-        "IMAGE_MATCH_THRESHOLD",
-        "0.78",
-    )
-)
+OCR_SCALE = 2.0
 
-TEXT_MATCH_THRESHOLD = float(
-    os.getenv(
-        "TEXT_MATCH_THRESHOLD",
-        "0.84",
-    )
-)
+# Minimum confidence before OCR text is considered useful.
+OCR_MIN_CONFIDENCE = 35
 
-INPAINT_RADIUS = int(
-    os.getenv(
-        "INPAINT_RADIUS",
-        "3",
-    )
-)
+# Temporal detection thresholds.
+TEMPORAL_STD_THRESHOLD = 8.0
+TEMPORAL_DIFF_THRESHOLD = 7.0
 
-MASK_DILATION = int(
-    os.getenv(
-        "MASK_DILATION",
-        "3",
-    )
-)
+# Morphological expansion around detected watermark.
+MASK_DILATION_PIXELS = 7
+
+# Inpainting radius.
+INPAINT_RADIUS = 5
+
+# If the automatically detected region is absurdly large,
+# don't touch the image.
+MAX_MASK_AREA_RATIO = 0.12
 
 
 # ============================================================
-# STARTUP
+# CAPTION PROCESSING
 # ============================================================
 
-print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-print("🧹 WATERMARK REMOVAL PROCESSOR STARTED")
-print("📁 Watermark directory:", WATERMARK_DIR)
-print("🧠 OpenAI Vision: DISABLED")
-print("🎨 Image generation: DISABLED")
-print("🧹 Watermark removal: OPENCV INPAINTING")
-print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-
-
-# ============================================================
-# BASIC MEDIA DETECTION
-# ============================================================
-
-def is_video_container(data: bytes) -> bool:
+def replace_username(text: str) -> str:
     """
-    Detect MP4/MOV/WebM.
+    Caption processing remains EXACTLY as requested.
+
+    1. Remove '*'
+    2. Replace OLD_MENTION with NEW_MENTION
+
+    No AI rewriting.
+    No paraphrasing.
+    No other caption changes.
     """
 
-    if not data:
-        return False
+    if not text:
+        return text
 
-    # MP4/MOV/M4V/etc.
+    result = text.replace("*", "")
+
+    if NEW_MENTION:
+        result = re.sub(
+            re.escape(OLD_MENTION),
+            NEW_MENTION,
+            result,
+            flags=re.IGNORECASE,
+        )
+    else:
+        logger.warning(
+            "NEW_MENTION is empty. Username was not replaced."
+        )
+
+    return result
+
+
+async def rewrite_text(original_text: str) -> str:
+    """
+    Kept with the same function name so main.py
+    does not need to change its caption interface.
+    """
+
+    result = replace_username(original_text)
+
+    logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    logger.info("📝 CAPTION PROCESSING")
+    logger.info("📝 ORIGINAL: %r", original_text)
+    logger.info("📝 FINAL:    %r", result)
+    logger.info("👤 OLD:      %r", OLD_MENTION)
+    logger.info("👤 NEW:      %r", NEW_MENTION)
+    logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    return result
+
+
+# ============================================================
+# GENERAL HELPERS
+# ============================================================
+
+def _is_mp4_or_video(data: bytes) -> bool:
+    """
+    Telegram GIFs are frequently delivered as MP4.
+    """
+
     if len(data) >= 12 and data[4:8] == b"ftyp":
         return True
 
     # WebM / Matroska
-    if data.startswith(
-        b"\x1a\x45\xdf\xa3"
-    ):
+    if data.startswith(b"\x1a\x45\xdf\xa3"):
         return True
 
     return False
 
 
-def is_animated_image(data: bytes) -> bool:
+def _pil_to_bgr(image: Image.Image) -> np.ndarray:
+    rgb = image.convert("RGB")
+    return cv2.cvtColor(
+        np.asarray(rgb),
+        cv2.COLOR_RGB2BGR,
+    )
+
+
+def _bgr_to_pil(frame: np.ndarray) -> Image.Image:
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(rgb)
+
+
+def _resize_for_ocr(image: np.ndarray) -> np.ndarray:
+    if OCR_SCALE <= 1:
+        return image
+
+    return cv2.resize(
+        image,
+        None,
+        fx=OCR_SCALE,
+        fy=OCR_SCALE,
+        interpolation=cv2.INTER_CUBIC,
+    )
+
+
+# ============================================================
+# OCR DETECTION
+# ============================================================
+
+def detect_cappersfree_text(
+    image: np.ndarray,
+) -> np.ndarray | None:
     """
-    Detect animated GIF/WebP.
+    Try to locate literal @cappersfree text.
+
+    Returns a mask or None.
+
+    OCR is only one detector. The GIF temporal detector
+    handles graphical/pulsing CF material.
     """
 
     try:
-        with Image.open(
-            io.BytesIO(data)
-        ) as image:
+        enlarged = _resize_for_ocr(image)
 
-            return bool(
-                getattr(
-                    image,
-                    "is_animated",
-                    False,
+        rgb = cv2.cvtColor(
+            enlarged,
+            cv2.COLOR_BGR2RGB,
+        )
+
+        data = pytesseract.image_to_data(
+            rgb,
+            config="--psm 11",
+            output_type=pytesseract.Output.DICT,
+        )
+
+        mask = np.zeros(
+            image.shape[:2],
+            dtype=np.uint8,
+        )
+
+        found = False
+
+        count = len(data["text"])
+
+        for i in range(count):
+
+            text = (
+                data["text"][i]
+                or ""
+            ).strip()
+
+            if not text:
+                continue
+
+            try:
+                confidence = float(
+                    data["conf"][i]
                 )
+            except Exception:
+                confidence = 0
+
+            if confidence < OCR_MIN_CONFIDENCE:
+                continue
+
+            normalized = re.sub(
+                r"[^a-z0-9@]",
+                "",
+                text.lower(),
             )
 
-    except Exception:
-        return False
+            # Direct detection.
+            matches = (
+                "cappersfree" in normalized
+                or "@cappersfree" in normalized
+            )
 
+            if not matches:
+                continue
 
-# ============================================================
-# WATERMARK TEMPLATE LOADING
-# ============================================================
+            x = int(data["left"][i] / OCR_SCALE)
+            y = int(data["top"][i] / OCR_SCALE)
+            w = int(data["width"][i] / OCR_SCALE)
+            h = int(data["height"][i] / OCR_SCALE)
 
-def get_watermark_files():
-    """
-    Find all watermark template images.
+            if w <= 0 or h <= 0:
+                continue
 
-    Every image inside:
+            x1 = max(0, x)
+            y1 = max(0, y)
+            x2 = min(image.shape[1], x + w)
+            y2 = min(image.shape[0], y + h)
 
-        assets/watermarks/
+            if x2 <= x1 or y2 <= y1:
+                continue
 
-    is treated as a watermark template.
-
-    This means you can add:
-        cf_logo.png
-        cappersfree.png
-        cf_logo_small.png
-        another_watermark.png
-
-    without changing this Python file.
-    """
-
-    if not WATERMARK_DIR.exists():
-
-        logger.warning(
-            "⚠️ Watermark directory does not exist: %s",
-            WATERMARK_DIR,
-        )
-
-        return []
-
-    allowed_extensions = {
-        ".png",
-        ".jpg",
-        ".jpeg",
-        ".webp",
-        ".bmp",
-    }
-
-    files = []
-
-    for path in sorted(
-        WATERMARK_DIR.iterdir()
-    ):
-
-        if not path.is_file():
-            continue
-
-        if path.suffix.lower() not in allowed_extensions:
-            continue
-
-        files.append(path)
-
-    return files
-
-
-def load_watermark_template(
-    path: Path,
-):
-    """
-    Load watermark template.
-
-    Returns:
-
-        template_bgr
-        alpha_mask
-        filename
-    """
-
-    try:
-
-        image = Image.open(path).convert(
-            "RGBA"
-        )
-
-        rgba = np.array(image)
-
-        rgb = rgba[:, :, :3]
-        alpha = rgba[:, :, 3]
-
-        # ----------------------------------------------------
-        # Crop completely transparent edges.
-        # ----------------------------------------------------
-
-        alpha_pixels = np.where(
-            alpha > 5
-        )
-
-        if len(alpha_pixels[0]) > 0:
-
-            y1 = int(alpha_pixels[0].min())
-            y2 = int(alpha_pixels[0].max()) + 1
-
-            x1 = int(alpha_pixels[1].min())
-            x2 = int(alpha_pixels[1].max()) + 1
-
-            rgb = rgb[
-                y1:y2,
-                x1:x2,
-            ]
-
-            alpha = alpha[
-                y1:y2,
-                x1:x2,
-            ]
-
-        # ----------------------------------------------------
-        # For template matching, transparent pixels are
-        # composited onto white.
-        # ----------------------------------------------------
-
-        alpha_float = (
-            alpha.astype(np.float32)
-            / 255.0
-        )
-
-        white = np.full_like(
-            rgb,
-            255,
-        )
-
-        composite = (
-            rgb.astype(np.float32)
-            * alpha_float[:, :, None]
-            +
-            white.astype(np.float32)
-            * (1.0 - alpha_float[:, :, None])
-        )
-
-        composite = np.clip(
-            composite,
-            0,
-            255,
-        ).astype(np.uint8)
-
-        template_bgr = cv2.cvtColor(
-            composite,
-            cv2.COLOR_RGB2BGR,
-        )
-
-        # ----------------------------------------------------
-        # Alpha becomes the actual area to remove.
-        #
-        # If the source has no transparency, remove the
-        # complete template rectangle.
-        # ----------------------------------------------------
-
-        if np.max(alpha) <= 5:
-
-            mask = np.ones(
-                alpha.shape,
-                dtype=np.uint8,
-            ) * 255
-
-        else:
-
-            mask = np.where(
-                alpha > 10,
+            cv2.rectangle(
+                mask,
+                (x1, y1),
+                (x2, y2),
                 255,
-                0,
-            ).astype(np.uint8)
+                -1,
+            )
 
-        return (
-            template_bgr,
-            mask,
-            path.name,
-        )
+            found = True
+
+        if not found:
+            return None
+
+        return _expand_mask(mask)
 
     except Exception:
-
         logger.exception(
-            "❌ Could not load watermark template: %s",
-            path,
+            "⚠️ OCR watermark detection failed."
         )
-
         return None
 
 
 # ============================================================
-# TEMPLATE MATCHING
+# MASK EXPANSION
 # ============================================================
 
-def _intersection_over_union(
-    a,
-    b,
-):
+def _expand_mask(
+    mask: np.ndarray,
+    pixels: int = MASK_DILATION_PIXELS,
+) -> np.ndarray:
+
+    if mask is None:
+        return None
+
+    if pixels <= 0:
+        return mask
+
+    kernel_size = pixels * 2 + 1
+
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (kernel_size, kernel_size),
+    )
+
+    return cv2.dilate(
+        mask,
+        kernel,
+        iterations=1,
+    )
+
+
+# ============================================================
+# GIF TEMPORAL MASK LEARNING
+# ============================================================
+
+def learn_fixed_pulsing_mask(
+    frames: list[np.ndarray],
+) -> np.ndarray | None:
     """
-    Calculate IoU for two boxes.
+    Automatically learn a fixed watermark region from GIF frames.
 
-    Box format:
+    Assumption for this application:
 
-        x1, y1, x2, y2
-    """
+        CF logo remains in one location
+        but pulses/fades in and out.
 
-    ax1, ay1, ax2, ay2 = a
-    bx1, by1, bx2, by2 = b
+    Therefore the logo produces persistent temporal variation
+    in approximately the same spatial region.
 
-    ix1 = max(ax1, bx1)
-    iy1 = max(ay1, by1)
+    The detector:
 
-    ix2 = min(ax2, bx2)
-    iy2 = min(ay2, by2)
+        1. Converts frames to grayscale.
+        2. Computes temporal standard deviation.
+        3. Computes frame-to-frame differences.
+        4. Combines the two signals.
+        5. Finds persistent connected regions.
+        6. Rejects enormous regions.
+        7. Expands the resulting region.
 
-    if ix2 <= ix1 or iy2 <= iy1:
-        return 0.0
-
-    intersection = (
-        (ix2 - ix1)
-        * (iy2 - iy1)
-    )
-
-    area_a = (
-        (ax2 - ax1)
-        * (ay2 - ay1)
-    )
-
-    area_b = (
-        (bx2 - bx1)
-        * (by2 - by1)
-    )
-
-    union = (
-        area_a
-        + area_b
-        - intersection
-    )
-
-    if union <= 0:
-        return 0.0
-
-    return intersection / union
-
-
-def find_template_matches(
-    image_bgr,
-    template_bgr,
-    threshold,
-):
-    """
-    Find multiple occurrences of a watermark.
-
-    Uses several scales because the watermark may not always
-    have exactly the same size.
+    It intentionally avoids changing the image when confidence
+    is too low.
     """
 
-    image_gray = cv2.cvtColor(
-        image_bgr,
-        cv2.COLOR_BGR2GRAY,
-    )
+    if not frames or len(frames) < 3:
+        return None
 
-    template_gray_original = cv2.cvtColor(
-        template_bgr,
-        cv2.COLOR_BGR2GRAY,
-    )
+    try:
 
-    image_height, image_width = (
-        image_gray.shape[:2]
-    )
+        # --------------------------------------------------------
+        # Make sure dimensions match.
+        # --------------------------------------------------------
 
-    original_height, original_width = (
-        template_gray_original.shape[:2]
-    )
+        height, width = frames[0].shape[:2]
 
-    if (
-        original_width < 4
-        or original_height < 4
-    ):
-        return []
+        normalized = []
 
-    # --------------------------------------------------------
-    # Multiple scales.
-    # --------------------------------------------------------
+        for frame in frames:
 
-    scales = [
-        0.35,
-        0.45,
-        0.55,
-        0.65,
-        0.75,
-        0.85,
-        1.00,
-        1.15,
-        1.30,
-        1.50,
-        1.75,
-        2.00,
-    ]
+            if frame.shape[:2] != (height, width):
 
-    candidates = []
+                frame = cv2.resize(
+                    frame,
+                    (width, height),
+                    interpolation=cv2.INTER_AREA,
+                )
 
-    for scale in scales:
-
-        width = max(
-            4,
-            int(
-                original_width
-                * scale
-            ),
-        )
-
-        height = max(
-            4,
-            int(
-                original_height
-                * scale
-            ),
-        )
-
-        if width >= image_width:
-            continue
-
-        if height >= image_height:
-            continue
-
-        template_gray = cv2.resize(
-            template_gray_original,
-            (width, height),
-            interpolation=(
-                cv2.INTER_AREA
-                if scale < 1
-                else cv2.INTER_LINEAR
-            ),
-        )
-
-        try:
-
-            result = cv2.matchTemplate(
-                image_gray,
-                template_gray,
-                cv2.TM_CCOEFF_NORMED,
+            gray = cv2.cvtColor(
+                frame,
+                cv2.COLOR_BGR2GRAY,
             )
 
-        except Exception:
-
-            logger.exception(
-                "❌ Template matching failed."
+            normalized.append(
+                gray.astype(np.float32)
             )
 
-            continue
+        stack = np.stack(
+            normalized,
+            axis=0,
+        )
 
-        # ----------------------------------------------------
-        # Find several peaks at this scale.
-        # ----------------------------------------------------
+        # --------------------------------------------------------
+        # Temporal standard deviation.
+        #
+        # A pulsing logo produces a localized region whose
+        # brightness changes between frames.
+        # --------------------------------------------------------
 
-        for _ in range(20):
+        temporal_std = np.std(
+            stack,
+            axis=0,
+        )
 
-            min_value, max_value, min_location, max_location = (
-                cv2.minMaxLoc(result)
+        # --------------------------------------------------------
+        # Frame-to-frame absolute difference.
+        # --------------------------------------------------------
+
+        diffs = np.abs(
+            stack[1:] - stack[:-1]
+        )
+
+        temporal_diff = np.mean(
+            diffs,
+            axis=0,
+        )
+
+        # --------------------------------------------------------
+        # Normalize both signals to 0-255.
+        # --------------------------------------------------------
+
+        std_norm = cv2.normalize(
+            temporal_std,
+            None,
+            0,
+            255,
+            cv2.NORM_MINMAX,
+        ).astype(np.uint8)
+
+        diff_norm = cv2.normalize(
+            temporal_diff,
+            None,
+            0,
+            255,
+            cv2.NORM_MINMAX,
+        ).astype(np.uint8)
+
+        # --------------------------------------------------------
+        # Threshold.
+        # --------------------------------------------------------
+
+        std_mask = cv2.threshold(
+            std_norm,
+            TEMPORAL_STD_THRESHOLD,
+            255,
+            cv2.THRESH_BINARY,
+        )[1]
+
+        diff_mask = cv2.threshold(
+            diff_norm,
+            TEMPORAL_DIFF_THRESHOLD,
+            255,
+            cv2.THRESH_BINARY,
+        )[1]
+
+        combined = cv2.bitwise_and(
+            std_mask,
+            diff_mask,
+        )
+
+        # --------------------------------------------------------
+        # Clean small noise.
+        # --------------------------------------------------------
+
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (5, 5),
+        )
+
+        combined = cv2.morphologyEx(
+            combined,
+            cv2.MORPH_OPEN,
+            kernel,
+        )
+
+        combined = cv2.morphologyEx(
+            combined,
+            cv2.MORPH_CLOSE,
+            kernel,
+        )
+
+        # --------------------------------------------------------
+        # Find connected components.
+        # --------------------------------------------------------
+
+        contours, _ = cv2.findContours(
+            combined,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+
+        if not contours:
+            return None
+
+        image_area = width * height
+
+        candidates = []
+
+        for contour in contours:
+
+            area = cv2.contourArea(contour)
+
+            if area < 20:
+                continue
+
+            ratio = area / image_area
+
+            # Reject huge regions. The watermark should not
+            # consume a significant part of the sports graphic.
+            if ratio > MAX_MASK_AREA_RATIO:
+                continue
+
+            x, y, w, h = cv2.boundingRect(
+                contour
             )
 
-            if max_value < threshold:
-                break
+            if w < 5 or h < 5:
+                continue
 
-            x = int(max_location[0])
-            y = int(max_location[1])
+            # Score using temporal intensity.
+            roi_std = temporal_std[
+                y:y + h,
+                x:x + w,
+            ]
 
-            box = (
-                x,
-                y,
-                x + width,
-                y + height,
+            roi_diff = temporal_diff[
+                y:y + h,
+                x:x + w,
+            ]
+
+            if roi_std.size == 0:
+                continue
+
+            score = (
+                float(np.mean(roi_std))
+                + float(np.mean(roi_diff))
             )
 
             candidates.append(
                 (
-                    float(max_value),
-                    box,
+                    score,
+                    contour,
                 )
             )
 
-            # Suppress this area so we can find another one.
-            suppression_radius_x = max(
-                4,
-                width // 2,
-            )
+        if not candidates:
+            return None
 
-            suppression_radius_y = max(
-                4,
-                height // 2,
-            )
+        # --------------------------------------------------------
+        # Take the strongest candidates.
+        #
+        # A pulsing logo may consist of several disconnected
+        # pieces, e.g. letters + icon.
+        # --------------------------------------------------------
 
-            sx1 = max(
-                0,
-                x - suppression_radius_x,
-            )
+        candidates.sort(
+            key=lambda item: item[0],
+            reverse=True,
+        )
 
-            sy1 = max(
-                0,
-                y - suppression_radius_y,
-            )
+        selected = candidates[:8]
 
-            sx2 = min(
-                result.shape[1],
-                x
-                + width
-                + suppression_radius_x,
-            )
+        mask = np.zeros(
+            (height, width),
+            dtype=np.uint8,
+        )
 
-            sy2 = min(
-                result.shape[0],
-                y
-                + height
-                + suppression_radius_y,
-            )
+        total_area = 0
 
-            result[
-                sy1:sy2,
-                sx1:sx2,
-            ] = -1
+        for _, contour in selected:
 
-    # --------------------------------------------------------
-    # Global non-maximum suppression.
-    # --------------------------------------------------------
+            area = cv2.contourArea(contour)
 
-    candidates.sort(
-        key=lambda item: item[0],
-        reverse=True,
-    )
-
-    selected = []
-
-    for score, box in candidates:
-
-        duplicate = False
-
-        for _, existing_box in selected:
-
-            if (
-                _intersection_over_union(
-                    box,
-                    existing_box,
-                )
-                > 0.35
+            if total_area + area > (
+                image_area
+                * MAX_MASK_AREA_RATIO
             ):
+                continue
 
-                duplicate = True
-                break
-
-        if duplicate:
-            continue
-
-        selected.append(
-            (
-                score,
-                box,
+            cv2.drawContours(
+                mask,
+                [contour],
+                -1,
+                255,
+                -1,
             )
+
+            total_area += area
+
+        if cv2.countNonZero(mask) == 0:
+            return None
+
+        # --------------------------------------------------------
+        # Close gaps between pieces of the logo.
+        # --------------------------------------------------------
+
+        close_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (11, 11),
         )
 
-        if len(selected) >= 30:
-            break
-
-    return selected
-
-
-# ============================================================
-# MASK CREATION
-# ============================================================
-
-def add_match_to_mask(
-    full_mask,
-    match_box,
-    template_mask,
-):
-    """
-    Put a detected watermark's mask onto the full image mask.
-    """
-
-    x1, y1, x2, y2 = match_box
-
-    image_height, image_width = (
-        full_mask.shape[:2]
-    )
-
-    # Clip to image.
-    x1 = max(0, x1)
-    y1 = max(0, y1)
-
-    x2 = min(
-        image_width,
-        x2,
-    )
-
-    y2 = min(
-        image_height,
-        y2,
-    )
-
-    if x2 <= x1 or y2 <= y1:
-        return
-
-    width = x2 - x1
-    height = y2 - y1
-
-    resized_mask = cv2.resize(
-        template_mask,
-        (width, height),
-        interpolation=cv2.INTER_NEAREST,
-    )
-
-    full_mask[
-        y1:y2,
-        x1:x2,
-    ] = np.maximum(
-        full_mask[
-            y1:y2,
-            x1:x2,
-        ],
-        resized_mask,
-    )
-
-
-def remove_watermarks_from_frame(
-    frame_bgr,
-):
-    """
-    Detect all configured watermark templates and remove
-    every detected occurrence from one frame.
-    """
-
-    template_files = (
-        get_watermark_files()
-    )
-
-    if not template_files:
-
-        logger.error(
-            "❌ No watermark templates found."
+        mask = cv2.morphologyEx(
+            mask,
+            cv2.MORPH_CLOSE,
+            close_kernel,
         )
 
-        logger.error(
-            "❌ Add watermark images to: %s",
-            WATERMARK_DIR,
+        mask = _expand_mask(mask)
+
+        # --------------------------------------------------------
+        # Final sanity check.
+        # --------------------------------------------------------
+
+        final_ratio = (
+            cv2.countNonZero(mask)
+            / image_area
         )
 
+        if final_ratio > MAX_MASK_AREA_RATIO:
+            logger.warning(
+                "⚠️ Learned mask is too large: %.2f%%",
+                final_ratio * 100,
+            )
+            return None
+
+        logger.info(
+            "🧠 Learned fixed pulsing mask: %.2f%% of frame",
+            final_ratio * 100,
+        )
+
+        return mask
+
+    except Exception:
+        logger.exception(
+            "❌ Could not learn pulsing watermark mask."
+        )
         return None
 
-    full_mask = np.zeros(
-        frame_bgr.shape[:2],
-        dtype=np.uint8,
+
+# ============================================================
+# MASK COMBINATION
+# ============================================================
+
+def combine_masks(
+    first: np.ndarray | None,
+    second: np.ndarray | None,
+) -> np.ndarray | None:
+
+    if first is None and second is None:
+        return None
+
+    if first is None:
+        return second
+
+    if second is None:
+        return first
+
+    return cv2.bitwise_or(
+        first,
+        second,
     )
-
-    total_matches = 0
-
-    for template_path in template_files:
-
-        loaded = load_watermark_template(
-            template_path
-        )
-
-        if not loaded:
-            continue
-
-        (
-            template_bgr,
-            template_mask,
-            template_name,
-        ) = loaded
-
-        template_height, template_width = (
-            template_bgr.shape[:2]
-        )
-
-        # ----------------------------------------------------
-        # Use a stronger threshold for tiny text templates.
-        # ----------------------------------------------------
-
-        if (
-            template_width
-            * template_height
-            < 10000
-        ):
-
-            threshold = (
-                TEXT_MATCH_THRESHOLD
-            )
-
-        else:
-
-            threshold = (
-                IMAGE_MATCH_THRESHOLD
-            )
-
-        matches = find_template_matches(
-            frame_bgr,
-            template_bgr,
-            threshold,
-        )
-
-        if matches:
-
-            logger.info(
-                "🧹 %s: found %d occurrence(s)",
-                template_name,
-                len(matches),
-            )
-
-        for score, box in matches:
-
-            logger.debug(
-                "🧹 Match %s score=%.3f box=%s",
-                template_name,
-                score,
-                box,
-            )
-
-            add_match_to_mask(
-                full_mask,
-                box,
-                template_mask,
-            )
-
-            total_matches += 1
-
-    if total_matches == 0:
-
-        # No watermark detected.
-        # IMPORTANT:
-        # Return the original frame unchanged.
-        return frame_bgr
-
-    # --------------------------------------------------------
-    # Slightly expand the mask.
-    #
-    # This helps remove edges around the logo/text.
-    # --------------------------------------------------------
-
-    if MASK_DILATION > 0:
-
-        kernel_size = (
-            MASK_DILATION * 2
-        ) + 1
-
-        kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,
-            (
-                kernel_size,
-                kernel_size,
-            ),
-        )
-
-        full_mask = cv2.dilate(
-            full_mask,
-            kernel,
-            iterations=1,
-        )
-
-    # --------------------------------------------------------
-    # OpenCV inpainting.
-    #
-    # This does NOT generate a new image.
-    # It reconstructs the masked pixels from surrounding
-    # pixels.
-    # --------------------------------------------------------
-
-    cleaned = cv2.inpaint(
-        frame_bgr,
-        full_mask,
-        INPAINT_RADIUS,
-        cv2.INPAINT_NS,
-    )
-
-    logger.info(
-        "🧹 Removed %d watermark occurrence(s).",
-        total_matches,
-    )
-
-    return cleaned
 
 
 # ============================================================
-# STILL IMAGE
+# INPAINTING
 # ============================================================
 
-def process_still_image(
+def remove_watermark(
+    frame: np.ndarray,
+    mask: np.ndarray | None,
+) -> np.ndarray:
+
+    if mask is None:
+        return frame
+
+    if cv2.countNonZero(mask) == 0:
+        return frame
+
+    try:
+
+        result = cv2.inpaint(
+            frame,
+            mask,
+            INPAINT_RADIUS,
+            cv2.INPAINT_TELEA,
+        )
+
+        return result
+
+    except Exception:
+        logger.exception(
+            "⚠️ Inpainting failed; returning original frame."
+        )
+        return frame
+
+
+# ============================================================
+# STATIC IMAGE PROCESSING
+# ============================================================
+
+def process_static_image(
     image_bytes: bytes,
 ):
     """
     Process a normal image.
+
+    The original image is preserved except for a detected
+    watermark region.
     """
 
     try:
 
-        image = Image.open(
+        source = Image.open(
             io.BytesIO(image_bytes)
-        ).convert("RGBA")
-
-        rgba = np.array(image)
-
-        rgb = rgba[:, :, :3]
-        alpha = rgba[:, :, 3]
-
-        # OpenCV works with BGR.
-        bgr = cv2.cvtColor(
-            rgb,
-            cv2.COLOR_RGB2BGR,
         )
 
-        cleaned_bgr = (
-            remove_watermarks_from_frame(
-                bgr
+        source.load()
+
+        frame = _pil_to_bgr(source)
+
+        # OCR can directly identify @cappersfree.
+        ocr_mask = detect_cappersfree_text(
+            frame
+        )
+
+        if ocr_mask is None:
+
+            logger.info(
+                "ℹ️ No @cappersfree text detected."
             )
-        )
 
-        if cleaned_bgr is None:
-            return None
+            # Do not blindly modify a static image when we have
+            # no reliable watermark detection.
+            output_frame = frame
 
-        cleaned_rgb = cv2.cvtColor(
-            cleaned_bgr,
-            cv2.COLOR_BGR2RGB,
-        )
+        else:
 
-        cleaned_rgba = np.dstack(
-            (
-                cleaned_rgb,
-                alpha,
+            logger.info(
+                "🔎 @cappersfree watermark detected."
             )
+
+            output_frame = remove_watermark(
+                frame,
+                ocr_mask,
+            )
+
+        output = _bgr_to_pil(
+            output_frame
         )
 
-        output_image = Image.fromarray(
-            cleaned_rgba,
-            "RGBA",
-        )
+        # Preserve PNG-like output.
+        buffer = io.BytesIO()
 
-        output = io.BytesIO()
-
-        output_image.save(
-            output,
+        output.save(
+            buffer,
             format="PNG",
-            optimize=True,
         )
 
-        return (
-            output.getvalue(),
-            "photo",
+        return BufferedInputFile(
+            buffer.getvalue(),
+            filename="cleaned.png",
         )
 
     except Exception:
-
         logger.exception(
-            "❌ STILL IMAGE PROCESSING FAILED"
+            "❌ STATIC IMAGE PROCESSING FAILED"
         )
-
         return None
 
 
 # ============================================================
-# FFMPEG
-# ============================================================
-
-def get_ffmpeg():
-    """
-    Get the ffmpeg binary supplied by imageio-ffmpeg.
-    """
-
-    try:
-
-        from imageio_ffmpeg import (
-            get_ffmpeg_exe,
-        )
-
-        return get_ffmpeg_exe()
-
-    except ImportError:
-
-        logger.error(
-            "❌ imageio-ffmpeg is missing."
-        )
-
-        return None
-
-
-def encode_frames_to_mp4(
-    frames_dir: Path,
-    fps: float,
-    output_path: Path,
-):
-    """
-    Encode processed PNG frames into MP4.
-    """
-
-    ffmpeg = get_ffmpeg()
-
-    if not ffmpeg:
-        return False
-
-    command = [
-        ffmpeg,
-        "-y",
-
-        "-framerate",
-        str(max(1.0, fps)),
-
-        "-i",
-        str(
-            frames_dir
-            / "frame_%06d.png"
-        ),
-
-        "-c:v",
-        "libx264",
-
-        "-preset",
-        "veryfast",
-
-        "-crf",
-        "18",
-
-        "-pix_fmt",
-        "yuv420p",
-
-        "-movflags",
-        "+faststart",
-
-        str(output_path),
-    ]
-
-    result = subprocess.run(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=300,
-    )
-
-    if result.returncode != 0:
-
-        logger.error(
-            "❌ FFmpeg encoding failed:"
-        )
-
-        logger.error(
-            result.stderr.decode(
-                "utf-8",
-                errors="replace",
-            )[-4000:]
-        )
-
-        return False
-
-    return (
-        output_path.exists()
-        and output_path.stat().st_size > 0
-    )
-
-
-# ============================================================
-# ANIMATED GIF
+# GIF PROCESSING
 # ============================================================
 
 def process_gif(
     image_bytes: bytes,
 ):
     """
-    Process every GIF frame.
+    Process an actual GIF.
 
-    The result is MP4 rather than GIF so it can be included
-    together with photos in a Telegram media group.
+    Every frame is inspected.
+
+    The CF logo is expected to remain in one fixed position
+    while pulsing/fading.
+
+    A single learned mask is applied to every frame so that
+    the animation remains synchronized.
     """
 
     try:
@@ -1003,351 +786,540 @@ def process_gif(
         )
 
         frames = []
-
         durations = []
 
-        for frame in ImageSequence.Iterator(
-            source
-        ):
+        loop = source.info.get(
+            "loop",
+            0,
+        )
 
-            rgba = frame.convert(
-                "RGBA"
-            )
+        for frame in ImageSequence.Iterator(source):
 
-            rgba_array = np.array(
-                rgba
-            )
-
-            rgb = rgba_array[:, :, :3]
-
-            alpha = rgba_array[:, :, 3]
-
-            bgr = cv2.cvtColor(
-                rgb,
-                cv2.COLOR_RGB2BGR,
-            )
-
-            cleaned_bgr = (
-                remove_watermarks_from_frame(
-                    bgr
-                )
-            )
-
-            if cleaned_bgr is None:
-                return None
-
-            cleaned_rgb = cv2.cvtColor(
-                cleaned_bgr,
-                cv2.COLOR_BGR2RGB,
-            )
-
-            cleaned_rgba = np.dstack(
-                (
-                    cleaned_rgb,
-                    alpha,
-                )
-            )
-
-            cleaned = Image.fromarray(
-                cleaned_rgba,
-                "RGBA",
+            converted = frame.convert(
+                "RGB"
             )
 
             frames.append(
-                cleaned
-            )
-
-            duration = frame.info.get(
-                "duration",
-                source.info.get(
-                    "duration",
-                    100,
-                ),
+                _pil_to_bgr(converted)
             )
 
             durations.append(
-                max(
-                    10,
-                    int(duration or 100),
+                int(
+                    frame.info.get(
+                        "duration",
+                        source.info.get(
+                            "duration",
+                            100,
+                        ),
+                    )
                 )
             )
 
         if not frames:
+            logger.error(
+                "❌ GIF contains no frames."
+            )
             return None
 
-        # Average GIF frame duration.
-        average_duration = (
-            sum(durations)
-            / len(durations)
+        logger.info(
+            "🎞️ GIF contains %d frames.",
+            len(frames),
         )
 
-        fps = (
-            1000.0
-            / average_duration
+        # --------------------------------------------------------
+        # Learn fixed pulsing CF region.
+        # --------------------------------------------------------
+
+        learned_mask = learn_fixed_pulsing_mask(
+            frames
         )
 
-        with tempfile.TemporaryDirectory() as tmp:
+        # --------------------------------------------------------
+        # OCR detection across several frames.
+        #
+        # This helps if the literal @cappersfree text is visible
+        # during some frames but not others.
+        # --------------------------------------------------------
 
-            tmp_dir = Path(tmp)
+        ocr_mask = None
 
-            for index, frame in enumerate(
-                frames
-            ):
+        sample_indexes = np.linspace(
+            0,
+            len(frames) - 1,
+            min(8, len(frames)),
+            dtype=int,
+        )
 
-                frame_path = (
-                    tmp_dir
-                    / f"frame_{index:06d}.png"
-                )
+        for index in sample_indexes:
 
-                frame.save(
-                    frame_path,
-                    format="PNG",
-                )
-
-            output_path = (
-                tmp_dir
-                / "cleaned.mp4"
+            candidate = detect_cappersfree_text(
+                frames[index]
             )
 
-            success = (
-                encode_frames_to_mp4(
-                    tmp_dir,
-                    fps,
-                    output_path,
-                )
+            ocr_mask = combine_masks(
+                ocr_mask,
+                candidate,
             )
 
-            if not success:
-                return None
+        final_mask = combine_masks(
+            learned_mask,
+            ocr_mask,
+        )
 
-            return (
-                output_path.read_bytes(),
-                "video",
+        if final_mask is None:
+
+            logger.info(
+                "ℹ️ No sufficiently reliable CF watermark detected."
             )
+
+            # Return original GIF rather than damaging it.
+            return BufferedInputFile(
+                image_bytes,
+                filename="cleaned.gif",
+            )
+
+        # --------------------------------------------------------
+        # Apply the same learned mask to every frame.
+        # --------------------------------------------------------
+
+        cleaned_frames = []
+
+        for index, frame in enumerate(frames):
+
+            cleaned = remove_watermark(
+                frame,
+                final_mask,
+            )
+
+            cleaned_frames.append(
+                _bgr_to_pil(cleaned)
+            )
+
+            logger.debug(
+                "🧹 Cleaned GIF frame %d/%d",
+                index + 1,
+                len(frames),
+            )
+
+        # --------------------------------------------------------
+        # Rebuild GIF.
+        # --------------------------------------------------------
+
+        output = io.BytesIO()
+
+        first = cleaned_frames[0]
+
+        first.save(
+            output,
+            format="GIF",
+            save_all=True,
+            append_images=cleaned_frames[1:],
+            duration=durations,
+            loop=loop,
+            optimize=False,
+        )
+
+        gif_bytes = output.getvalue()
+
+        logger.info(
+            "✅ Cleaned GIF generated: %d bytes",
+            len(gif_bytes),
+        )
+
+        return BufferedInputFile(
+            gif_bytes,
+            filename="cleaned.gif",
+        )
 
     except Exception:
-
         logger.exception(
             "❌ GIF PROCESSING FAILED"
         )
-
         return None
 
 
 # ============================================================
-# VIDEO / MP4
+# VIDEO / TELEGRAM GIF-AS-MP4
 # ============================================================
 
-def process_video(
+def _extract_mp4_frames(
     video_bytes: bytes,
 ):
     """
-    Process every video frame and produce a cleaned MP4.
+    Extract frames from Telegram's MP4 representation of a GIF.
+
+    Returns:
+
+        frames
+        durations
+        width
+        height
     """
+
+    try:
+
+        from imageio_ffmpeg import get_ffmpeg_exe
+
+        ffmpeg = get_ffmpeg_exe()
+
+    except Exception:
+        logger.exception(
+            "❌ imageio-ffmpeg is unavailable."
+        )
+        return None
 
     try:
 
         with tempfile.TemporaryDirectory() as tmp:
 
-            tmp_dir = Path(tmp)
+            tmp_path = Path(tmp)
 
             input_path = (
-                tmp_dir
-                / "input.mp4"
+                tmp_path / "input.mp4"
+            )
+
+            output_pattern = str(
+                tmp_path / "frame_%06d.png"
             )
 
             input_path.write_bytes(
                 video_bytes
             )
 
-            capture = cv2.VideoCapture(
-                str(input_path)
+            command = [
+                ffmpeg,
+                "-y",
+                "-i",
+                str(input_path),
+                "-vsync",
+                "0",
+                output_pattern,
+            ]
+
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=120,
             )
 
-            if not capture.isOpened():
+            if result.returncode != 0:
 
                 logger.error(
-                    "❌ Could not open video."
+                    "❌ FFmpeg failed: %s",
+                    result.stderr.decode(
+                        "utf-8",
+                        errors="replace",
+                    )[-3000:],
                 )
 
                 return None
 
-            fps = capture.get(
-                cv2.CAP_PROP_FPS
+            frame_paths = sorted(
+                tmp_path.glob(
+                    "frame_*.png"
+                )
             )
 
-            if not fps or fps <= 0:
-                fps = 15.0
+            if not frame_paths:
+                return None
 
-            frame_number = 0
+            frames = []
 
-            while True:
+            for path in frame_paths:
 
-                success, frame = (
-                    capture.read()
-                )
+                with Image.open(path) as image:
 
-                if not success:
-                    break
-
-                cleaned = (
-                    remove_watermarks_from_frame(
-                        frame
+                    frames.append(
+                        _pil_to_bgr(
+                            image.convert("RGB")
+                        )
                     )
-                )
 
-                if cleaned is None:
+            # ----------------------------------------------------
+            # Obtain FPS.
+            # ----------------------------------------------------
 
-                    capture.release()
+            probe_command = [
+                ffmpeg,
+                "-i",
+                str(input_path),
+            ]
 
-                    return None
+            probe = subprocess.run(
+                probe_command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=30,
+            )
 
-                frame_path = (
-                    tmp_dir
-                    / (
-                        f"frame_"
-                        f"{frame_number:06d}.png"
+            stderr = probe.stderr.decode(
+                "utf-8",
+                errors="replace",
+            )
+
+            fps = 15.0
+
+            match = re.search(
+                r"(\d+(?:\.\d+)?)\s+fps",
+                stderr,
+            )
+
+            if match:
+
+                try:
+                    fps = float(
+                        match.group(1)
                     )
-                )
+                except Exception:
+                    pass
 
-                cv2.imwrite(
-                    str(frame_path),
-                    cleaned,
-                )
-
-                frame_number += 1
-
-            capture.release()
-
-            if frame_number == 0:
-
-                logger.error(
-                    "❌ Video contained no frames."
-                )
-
-                return None
-
-            output_path = (
-                tmp_dir
-                / "cleaned.mp4"
+            duration_ms = max(
+                20,
+                int(
+                    1000 / fps
+                ),
             )
 
-            success = (
-                encode_frames_to_mp4(
-                    tmp_dir,
-                    fps,
-                    output_path,
-                )
-            )
-
-            if not success:
-                return None
+            durations = [
+                duration_ms
+            ] * len(frames)
 
             return (
-                output_path.read_bytes(),
-                "video",
+                frames,
+                durations,
             )
 
     except Exception:
-
         logger.exception(
-            "❌ VIDEO PROCESSING FAILED"
+            "❌ MP4 frame extraction failed."
         )
-
         return None
 
 
-# ============================================================
-# PUBLIC FUNCTION
-# ============================================================
-
-async def remove_watermarks_from_bytes(
-    media_bytes: bytes,
+def process_mp4_gif(
+    video_bytes: bytes,
 ):
     """
-    Main public function.
+    Telegram often sends GIFs as MP4.
 
-    Returns:
-
-        (
-            cleaned_bytes,
-            "photo"
-        )
-
-    or:
-
-        (
-            cleaned_bytes,
-            "video"
-        )
-
-    or None on failure.
-
-    NO OpenAI.
-    NO image generation.
-    NO caption processing.
+    Process every frame exactly like a GIF and rebuild
+    the result as an animated GIF.
     """
 
-    if not media_bytes:
+    extracted = _extract_mp4_frames(
+        video_bytes
+    )
+
+    if not extracted:
+        return None
+
+    frames, durations = extracted
+
+    if not frames:
+        return None
+
+    logger.info(
+        "🎞️ MP4/GIF: processing %d frames.",
+        len(frames),
+    )
+
+    learned_mask = learn_fixed_pulsing_mask(
+        frames
+    )
+
+    ocr_mask = None
+
+    sample_indexes = np.linspace(
+        0,
+        len(frames) - 1,
+        min(8, len(frames)),
+        dtype=int,
+    )
+
+    for index in sample_indexes:
+
+        candidate = detect_cappersfree_text(
+            frames[index]
+        )
+
+        ocr_mask = combine_masks(
+            ocr_mask,
+            candidate,
+        )
+
+    final_mask = combine_masks(
+        learned_mask,
+        ocr_mask,
+    )
+
+    # No reliable watermark = don't alter.
+    if final_mask is None:
+
+        logger.info(
+            "ℹ️ No reliable CF watermark found in MP4/GIF."
+        )
+
+        # Since Telegram supplied MP4, return it unchanged.
+        return BufferedInputFile(
+            video_bytes,
+            filename="cleaned.mp4",
+        )
+
+    cleaned_frames = []
+
+    for index, frame in enumerate(frames):
+
+        cleaned = remove_watermark(
+            frame,
+            final_mask,
+        )
+
+        cleaned_frames.append(
+            _bgr_to_pil(cleaned)
+        )
+
+    output = io.BytesIO()
+
+    cleaned_frames[0].save(
+        output,
+        format="GIF",
+        save_all=True,
+        append_images=cleaned_frames[1:],
+        duration=durations,
+        loop=0,
+        optimize=False,
+    )
+
+    logger.info(
+        "✅ MP4/GIF cleaned and rebuilt as GIF."
+    )
+
+    return BufferedInputFile(
+        output.getvalue(),
+        filename="cleaned.gif",
+    )
+
+
+# ============================================================
+# MAIN MEDIA ENTRY POINT
+# ============================================================
+
+async def regenerate_image_from_bytes(
+    image_bytes: bytes,
+):
+    """
+    Compatibility function.
+
+    IMPORTANT:
+
+    This no longer regenerates anything.
+
+    It only removes a detected CF/@cappersfree watermark.
+
+        ORIGINAL
+            ↓
+        DETECTION
+            ↓
+        MASK
+            ↓
+        INPAINT
+            ↓
+        CLEANED ORIGINAL
+
+    No OpenAI.
+    No image generation.
+    No reconstruction.
+    """
+
+    if not image_bytes:
 
         logger.error(
-            "❌ Empty media received."
+            "❌ Empty media bytes."
         )
 
         return None
 
     logger.info(
-        "🧹 WATERMARK REMOVAL START"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    logger.info(
+        "🧹 WATERMARK REMOVAL PIPELINE START"
     )
 
     logger.info(
         "📦 Original bytes: %d",
-        len(media_bytes),
+        len(image_bytes),
     )
-
-    # --------------------------------------------------------
-    # Video / MP4 / WebM
-    # --------------------------------------------------------
-
-    if is_video_container(
-        media_bytes
-    ):
-
-        logger.info(
-            "🎞️ Video container detected."
-        )
-
-        return await asyncio.to_thread(
-            process_video,
-            media_bytes,
-        )
-
-    # --------------------------------------------------------
-    # Animated GIF / WebP
-    # --------------------------------------------------------
-
-    if is_animated_image(
-        media_bytes
-    ):
-
-        logger.info(
-            "🎞️ Animated image detected."
-        )
-
-        return await asyncio.to_thread(
-            process_gif,
-            media_bytes,
-        )
-
-    # --------------------------------------------------------
-    # Normal image
-    # --------------------------------------------------------
 
     logger.info(
-        "🖼️ Static image detected."
+        "🔬 Signature: %s",
+        bytes(
+            image_bytes[:16]
+        ).hex(" "),
     )
 
-    return await asyncio.to_thread(
-        process_still_image,
-        media_bytes,
-    )
+    try:
+
+        # --------------------------------------------------------
+        # Actual GIF.
+        # --------------------------------------------------------
+
+        if image_bytes.startswith(
+            b"GIF87a"
+        ) or image_bytes.startswith(
+            b"GIF89a"
+        ):
+
+            logger.info(
+                "🎞️ GIF detected."
+            )
+
+            return process_gif(
+                image_bytes
+            )
+
+        # --------------------------------------------------------
+        # Telegram GIF-as-MP4.
+        # --------------------------------------------------------
+
+        if _is_mp4_or_video(
+            image_bytes
+        ):
+
+            logger.info(
+                "🎞️ MP4/video container detected."
+            )
+
+            return process_mp4_gif(
+                image_bytes
+            )
+
+        # --------------------------------------------------------
+        # Normal image.
+        # --------------------------------------------------------
+
+        logger.info(
+            "🖼️ Static image detected."
+        )
+
+        return process_static_image(
+            image_bytes
+        )
+
+    except Exception:
+        logger.exception(
+            "❌ WATERMARK REMOVAL PIPELINE FAILED"
+        )
+
+        return None
+
+    finally:
+
+        logger.info(
+            "🧹 WATERMARK REMOVAL PIPELINE END"
+        )
+        logger.info(
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
