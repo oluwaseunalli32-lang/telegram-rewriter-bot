@@ -1,7 +1,7 @@
 import os
+import re
 import asyncio
 import logging
-
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -31,39 +31,15 @@ load_dotenv(
 
 
 # ============================================================
-# IMPORTS THAT READ ENVIRONMENT
+# IMPORTS THAT USE ENVIRONMENT
 # ============================================================
 
 import database
 
 from ai_processor import (
+    rewrite_text,
     remove_watermarks_from_bytes,
 )
-
-
-# ============================================================
-# CAPTION CONFIGURATION
-# ============================================================
-
-OLD_MENTION = os.getenv(
-    "OLD_MENTION",
-    "@cappersfree",
-).strip()
-
-NEW_MENTION = os.getenv(
-    "NEW_MENTION",
-    "",
-).strip()
-
-if (
-    NEW_MENTION
-    and not NEW_MENTION.startswith("@")
-):
-
-    NEW_MENTION = (
-        "@"
-        + NEW_MENTION
-    )
 
 
 # ============================================================
@@ -150,12 +126,7 @@ TARGET_CHANNEL_ID = -1004415621706
 # ALBUM CONFIGURATION
 # ============================================================
 
-# Telegram albums normally arrive very quickly as several
-# messages sharing the same grouped_id.
-#
-# We wait briefly before collecting the group so we don't
-# accidentally process only the first image.
-
+# Wait for Telegram to finish delivering the album.
 ALBUM_SETTLE_SECONDS = float(
     os.getenv(
         "ALBUM_SETTLE_SECONDS",
@@ -163,9 +134,7 @@ ALBUM_SETTLE_SECONDS = float(
     )
 )
 
-
 # Telegram media groups support up to 10 items.
-
 TELEGRAM_ALBUM_SIZE = 10
 
 
@@ -181,113 +150,6 @@ last_processed = {}
 
 
 # ============================================================
-# CAPTION PROCESSING
-# ============================================================
-
-def replace_username(
-    text: str,
-) -> str:
-
-    """
-    EXISTING CAPTION BEHAVIOR.
-
-    Only:
-
-        1. remove *
-        2. replace @cappersfree
-
-    No AI.
-    No paraphrasing.
-    No caption rewriting.
-    """
-
-    if not text:
-        return text
-
-    result = text
-
-    result = result.replace(
-        "*",
-        "",
-    )
-
-    if NEW_MENTION:
-
-        pattern = (
-            __import__("re")
-            .escape(
-                OLD_MENTION
-            )
-        )
-
-        result = __import__(
-            "re"
-        ).sub(
-            pattern,
-            NEW_MENTION,
-            result,
-            flags=__import__(
-                "re"
-            ).IGNORECASE,
-        )
-
-    else:
-
-        logger.warning(
-            "⚠️ NEW_MENTION is empty."
-        )
-
-    return result
-
-
-async def rewrite_text(
-    original_text: str,
-) -> str:
-
-    """
-    Kept identical in behavior to your existing script.
-    """
-
-    result = replace_username(
-        original_text
-    )
-
-    logger.info(
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    )
-
-    logger.info(
-        "📝 CAPTION PROCESSING"
-    )
-
-    logger.info(
-        "📝 ORIGINAL: %r",
-        original_text,
-    )
-
-    logger.info(
-        "📝 FINAL:    %r",
-        result,
-    )
-
-    logger.info(
-        "👤 OLD:      %r",
-        OLD_MENTION,
-    )
-
-    logger.info(
-        "👤 NEW:      %r",
-        NEW_MENTION,
-    )
-
-    logger.info(
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    )
-
-    return result
-
-
-# ============================================================
 # CONNECTION
 # ============================================================
 
@@ -297,8 +159,7 @@ async def ensure_connection():
         return True
 
     logger.warning(
-        "⚠️ Telegram client disconnected. "
-        "Reconnecting..."
+        "⚠️ Telegram client disconnected. Reconnecting..."
     )
 
     try:
@@ -332,10 +193,21 @@ async def ensure_connection():
 # ============================================================
 
 def get_image_media(msg):
+    """
+    Return Telegram media that can be cleaned.
 
+    Supports:
+        photos
+        images
+        GIFs
+        MP4 GIFs
+        MOV
+        WebM
     """
-    Return media that can be downloaded and cleaned.
-    """
+
+    # --------------------------------------------------------
+    # Normal Telegram photo.
+    # --------------------------------------------------------
 
     if getattr(
         msg,
@@ -344,6 +216,10 @@ def get_image_media(msg):
     ):
 
         return msg.photo
+
+    # --------------------------------------------------------
+    # Document media.
+    # --------------------------------------------------------
 
     document = getattr(
         msg,
@@ -415,11 +291,12 @@ def get_image_media(msg):
                 .lower()
             )
 
-            if extension in (
-                supported_extensions
-            ):
-
+            if extension in supported_extensions:
                 return document
+
+    # --------------------------------------------------------
+    # Telethon fallback.
+    # --------------------------------------------------------
 
     media = getattr(
         msg,
@@ -441,14 +318,40 @@ def get_image_media(msg):
 
 
 # ============================================================
-# DOWNLOAD + CLEAN ONE MEDIA
+# CAPTION EXTRACTION
+# ============================================================
+
+def get_message_text(msg):
+
+    return (
+        getattr(
+            msg,
+            "text",
+            None,
+        )
+        or getattr(
+            msg,
+            "message",
+            None,
+        )
+        or getattr(
+            msg,
+            "caption",
+            None,
+        )
+        or ""
+    )
+
+
+# ============================================================
+# CLEAN ONE TELEGRAM MESSAGE
 # ============================================================
 
 async def clean_message_media(
     msg,
 ):
     """
-    Download one Telegram media object and remove watermark(s).
+    Download one Telegram media object and clean it.
     """
 
     media = get_image_media(
@@ -492,7 +395,7 @@ async def clean_message_media(
     )
 
     logger.info(
-        "🧹 [%s] Removing watermark(s)...",
+        "🧹 [%s] Removing CF watermark...",
         msg.id,
     )
 
@@ -511,9 +414,7 @@ async def clean_message_media(
 
         return None
 
-    cleaned_bytes, media_type = (
-        cleaned
-    )
+    cleaned_bytes, media_type = cleaned
 
     logger.info(
         "✅ [%s] Cleaned media: %d bytes (%s)",
@@ -530,35 +431,25 @@ async def clean_message_media(
 
 
 # ============================================================
-# PROCESS ONE IMAGE
+# PROCESS SINGLE MESSAGE
 # ============================================================
 
 async def process_single_message(
     msg,
     target_id,
 ):
+    """
+    Process a normal non-album message.
+    """
 
-    original_text = (
-        getattr(
-            msg,
-            "text",
-            None,
-        )
-        or getattr(
-            msg,
-            "message",
-            None,
-        )
-        or getattr(
-            msg,
-            "caption",
-            None,
-        )
-        or ""
+    original_text = get_message_text(
+        msg
     )
 
     # --------------------------------------------------------
-    # CAPTION PROCESSING
+    # CAPTION.
+    #
+    # This remains completely separate from image processing.
     # --------------------------------------------------------
 
     caption = await rewrite_text(
@@ -569,6 +460,10 @@ async def process_single_message(
         msg
     )
 
+    # --------------------------------------------------------
+    # MEDIA.
+    # --------------------------------------------------------
+
     if media:
 
         cleaned = (
@@ -578,18 +473,33 @@ async def process_single_message(
         )
 
         if not cleaned:
-
             return False
 
-        filename = (
-            f"cleaned_{msg.id}"
+        message_id = cleaned[
+            "message_id"
+        ]
+
+        cleaned_bytes = cleaned[
+            "bytes"
+        ]
+
+        media_type = cleaned[
+            "type"
+        ]
+
+        filename_base = (
+            f"cleaned_{message_id}"
         )
 
-        if cleaned["type"] == "video":
+        # ----------------------------------------------------
+        # MP4/video.
+        # ----------------------------------------------------
+
+        if media_type == "video":
 
             file = BufferedInputFile(
-                cleaned["bytes"],
-                filename
+                cleaned_bytes,
+                filename_base
                 + ".mp4",
             )
 
@@ -604,11 +514,40 @@ async def process_single_message(
                 supports_streaming=True,
             )
 
+        # ----------------------------------------------------
+        # Actual GIF.
+        #
+        # Telegram's animation endpoint is used because an
+        # actual GIF should remain animated.
+        # ----------------------------------------------------
+
+        elif media_type == "gif":
+
+            file = BufferedInputFile(
+                cleaned_bytes,
+                filename_base
+                + ".gif",
+            )
+
+            await bot.send_animation(
+                chat_id=target_id,
+                animation=file,
+                caption=(
+                    caption[:1024]
+                    if caption
+                    else None
+                ),
+            )
+
+        # ----------------------------------------------------
+        # Normal image.
+        # ----------------------------------------------------
+
         else:
 
             file = BufferedInputFile(
-                cleaned["bytes"],
-                filename
+                cleaned_bytes,
+                filename_base
                 + ".png",
             )
 
@@ -630,7 +569,7 @@ async def process_single_message(
         return True
 
     # --------------------------------------------------------
-    # TEXT ONLY
+    # TEXT ONLY.
     # --------------------------------------------------------
 
     if caption:
@@ -651,7 +590,7 @@ async def process_single_message(
 
 
 # ============================================================
-# COLLECT COMPLETE ALBUM
+# COLLECT COMPLETE TELEGRAM ALBUM
 # ============================================================
 
 async def collect_album(
@@ -660,25 +599,21 @@ async def collect_album(
     minimum_id,
 ):
     """
-    Wait briefly and then collect all recent messages that
-    belong to the same Telegram album.
+    Wait briefly and re-fetch recent messages so all images
+    belonging to the Telegram album are collected.
     """
+
+    logger.info(
+        "⏳ Waiting %.1fs for album %s...",
+        ALBUM_SETTLE_SECONDS,
+        grouped_id,
+    )
 
     await asyncio.sleep(
         ALBUM_SETTLE_SECONDS
     )
 
     album_messages = {}
-
-    # --------------------------------------------------------
-    # First use messages already fetched.
-    # --------------------------------------------------------
-
-    # --------------------------------------------------------
-    # Re-fetch recent messages.
-    #
-    # This catches album items that arrived a fraction later.
-    # --------------------------------------------------------
 
     async for msg in user_client.iter_messages(
         channel,
@@ -727,16 +662,13 @@ async def process_album(
     target_id,
 ):
     """
-    Process every image in an album FIRST.
+    Clean every item in the album first.
 
-    Nothing is sent until every item has been successfully
-    cleaned.
-
-    This prevents a half-processed album from being posted.
+    Nothing is posted until all processable album items
+    have been cleaned successfully.
     """
 
     if not messages:
-
         return False
 
     logger.info(
@@ -757,33 +689,17 @@ async def process_album(
     )
 
     # --------------------------------------------------------
-    # Caption.
+    # Find album caption.
     #
-    # Telegram normally puts the album caption on the first
-    # message. We preserve your existing processing exactly.
+    # Telegram normally puts it on the first item.
     # --------------------------------------------------------
 
     album_caption = ""
 
     for msg in messages:
 
-        text = (
-            getattr(
-                msg,
-                "text",
-                None,
-            )
-            or getattr(
-                msg,
-                "message",
-                None,
-            )
-            or getattr(
-                msg,
-                "caption",
-                None,
-            )
-            or ""
+        text = get_message_text(
+            msg
         )
 
         if text:
@@ -797,7 +713,7 @@ async def process_album(
             break
 
     # --------------------------------------------------------
-    # Clean every item.
+    # Clean all album media.
     # --------------------------------------------------------
 
     cleaned_items = []
@@ -846,18 +762,44 @@ async def process_album(
         return False
 
     # --------------------------------------------------------
-    # Telegram allows max 10 media per media group.
+    # Albums containing actual GIFs/animations cannot be sent
+    # inside Telegram's normal photo/video media group.
     #
-    # If an unusually large group arrives, send chunks.
+    # We therefore:
+    #
+    #   1. Send normal photo/video items together.
+    #   2. Send actual GIF animations separately.
+    #
+    # Everything is still processed and posted.
+    # --------------------------------------------------------
+
+    normal_items = [
+        item
+        for item in cleaned_items
+        if item["type"]
+        in {
+            "photo",
+            "video",
+        }
+    ]
+
+    gif_items = [
+        item
+        for item in cleaned_items
+        if item["type"] == "gif"
+    ]
+
+    # --------------------------------------------------------
+    # Send normal media in Telegram groups of <= 10.
     # --------------------------------------------------------
 
     chunks = [
-        cleaned_items[
+        normal_items[
             i:i + TELEGRAM_ALBUM_SIZE
         ]
         for i in range(
             0,
-            len(cleaned_items),
+            len(normal_items),
             TELEGRAM_ALBUM_SIZE,
         )
     ]
@@ -868,11 +810,12 @@ async def process_album(
         chunks
     ):
 
+        if not chunk:
+            continue
+
         media_group = []
 
-        for item_index, item in enumerate(
-            chunk
-        ):
+        for item in chunk:
 
             filename_base = (
                 f"album_"
@@ -922,7 +865,6 @@ async def process_album(
                 )
 
             if caption:
-
                 caption_used = True
 
         logger.info(
@@ -935,6 +877,48 @@ async def process_album(
         await bot.send_media_group(
             chat_id=target_id,
             media=media_group,
+        )
+
+    # --------------------------------------------------------
+    # Send actual GIF animations.
+    # --------------------------------------------------------
+
+    for item in gif_items:
+
+        filename_base = (
+            f"album_"
+            f"{messages[0].id}_"
+            f"{item['message_id']}"
+        )
+
+        file = BufferedInputFile(
+            item["bytes"],
+            filename_base
+            + ".gif",
+        )
+
+        caption = None
+
+        if (
+            not caption_used
+            and album_caption
+        ):
+
+            caption = (
+                album_caption[:1024]
+            )
+
+            caption_used = True
+
+        logger.info(
+            "📤 Sending GIF %s...",
+            item["message_id"],
+        )
+
+        await bot.send_animation(
+            chat_id=target_id,
+            animation=file,
+            caption=caption,
         )
 
     logger.info(
@@ -967,18 +951,18 @@ async def process_channel(
 
     try:
 
-        channel = await (
-            user_client.get_entity(
-                source_id
-            )
+        channel = await user_client.get_entity(
+            source_id
         )
 
-        last_id = (
-            last_processed.get(
-                source_id,
-                0,
-            )
+        last_id = last_processed.get(
+            source_id,
+            0,
         )
+
+        # ----------------------------------------------------
+        # Fetch new messages chronologically.
+        # ----------------------------------------------------
 
         new_messages = []
 
@@ -996,7 +980,7 @@ async def process_channel(
             return
 
         # ----------------------------------------------------
-        # Group messages by Telegram grouped_id.
+        # Group album messages.
         # ----------------------------------------------------
 
         groups = {}
@@ -1029,7 +1013,7 @@ async def process_channel(
             ).append(msg)
 
         # ----------------------------------------------------
-        # Process groups in chronological order.
+        # Chronological groups.
         # ----------------------------------------------------
 
         ordered_groups = sorted(
@@ -1039,6 +1023,10 @@ async def process_channel(
                 for msg in group
             ),
         )
+
+        # ----------------------------------------------------
+        # Process each group.
+        # ----------------------------------------------------
 
         for initial_group in ordered_groups:
 
@@ -1052,11 +1040,11 @@ async def process_channel(
                 None,
             )
 
-            if grouped_id:
+            # =================================================
+            # ALBUM
+            # =================================================
 
-                # --------------------------------------------
-                # Collect the complete album.
-                # --------------------------------------------
+            if grouped_id:
 
                 messages = (
                     await collect_album(
@@ -1066,8 +1054,8 @@ async def process_channel(
                     )
                 )
 
-                # If re-fetch didn't find anything, use what
-                # was already discovered.
+                # If re-fetch failed to find the album,
+                # use the messages already fetched.
                 if not messages:
 
                     messages = sorted(
@@ -1075,7 +1063,7 @@ async def process_channel(
                         key=lambda m: m.id,
                     )
 
-                message_ids = [
+                message_keys = [
                     (
                         source_id,
                         msg.id,
@@ -1086,8 +1074,8 @@ async def process_channel(
                 async with processing_lock:
 
                     if any(
-                        item in processing_ids
-                        for item in message_ids
+                        key in processing_ids
+                        for key in message_keys
                     ):
 
                         logger.warning(
@@ -1098,7 +1086,7 @@ async def process_channel(
                         continue
 
                     processing_ids.update(
-                        message_ids
+                        message_keys
                     )
 
                 try:
@@ -1138,17 +1126,17 @@ async def process_channel(
 
                     async with processing_lock:
 
-                        for item in message_ids:
+                        for key in message_keys:
 
                             processing_ids.discard(
-                                item
+                                key
                             )
 
-            else:
+            # =================================================
+            # SINGLE MESSAGE
+            # =================================================
 
-                # --------------------------------------------
-                # Normal single message.
-                # --------------------------------------------
+            else:
 
                 msg = first_message
 
@@ -1220,7 +1208,10 @@ async def process_channel(
                             processing_key
                         )
 
+            # ------------------------------------------------
             # Small delay between groups.
+            # ------------------------------------------------
+
             await asyncio.sleep(2)
 
     except errors.rpcerrorlist.AuthKeyError as e:
@@ -1301,11 +1292,15 @@ async def main():
     )
 
     logger.info(
-        "   Image: watermark detection + OpenCV inpainting"
+        "   Image: OCR + temporal CF detection + OpenCV inpainting"
     )
 
     logger.info(
-        "   AI image generation: DISABLED"
+        "   OpenAI image generation: DISABLED"
+    )
+
+    logger.info(
+        "   GIF pulsing-mask learning: ENABLED"
     )
 
     logger.info(
@@ -1313,7 +1308,7 @@ async def main():
     )
 
     # --------------------------------------------------------
-    # Start Telegram user client.
+    # Start Telethon.
     # --------------------------------------------------------
 
     await user_client.start(
@@ -1365,6 +1360,9 @@ async def main():
 
     # --------------------------------------------------------
     # Start from newest message.
+    #
+    # This prevents old posts from being processed after a
+    # fresh deployment.
     # --------------------------------------------------------
 
     for client in (
@@ -1377,10 +1375,8 @@ async def main():
 
         try:
 
-            channel = await (
-                user_client.get_entity(
-                    source
-                )
+            channel = await user_client.get_entity(
+                source
             )
 
             async for msg in user_client.iter_messages(
