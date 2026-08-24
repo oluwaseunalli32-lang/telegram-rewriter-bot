@@ -11,6 +11,7 @@ import numpy as np
 
 from pathlib import Path
 from PIL import Image, ImageSequence
+from aiogram.types import BufferedInputFile
 
 
 # ============================================================
@@ -65,35 +66,31 @@ STRONG_RED_S_MIN = 55
 STRONG_RED_V_MIN = 45
 
 # Faded red.
-# Lower saturation/value lets us detect translucent red text.
 FADED_RED_S_MIN = 25
 FADED_RED_V_MIN = 28
 
-# Red dominance over green/blue.
+# Red channel must dominate the other channels.
 RED_DOMINANCE_MIN = 12
 
-# Minimum connected region.
+# Minimum connected component.
 MIN_RED_COMPONENT_AREA = 5
 
-# Ignore enormous red regions.
+# Ignore extremely large red regions.
 MAX_RED_COMPONENT_RATIO = 0.08
 
-# Horizontal grouping used to join letters such as:
-#
-# @ c a p p e r s f r e e
-#
+# Join individual red letters into text-like regions.
 RED_TEXT_KERNEL_WIDTH = 31
 RED_TEXT_KERNEL_HEIGHT = 7
 
-# Expand the final mask slightly.
+# Final mask expansion.
 MASK_DILATION = 5
 
-# Inpainting radius.
+# OpenCV inpainting radius.
 INPAINT_RADIUS = 5
 
 
 # ============================================================
-# LOGO TEMPLATE SETTINGS
+# CF LOGO SETTINGS
 # ============================================================
 
 LOGO_MATCH_THRESHOLD = 0.70
@@ -116,11 +113,12 @@ LOGO_SCALES = [
 
 MAX_LOGO_MATCHES = 5
 
+# Safety limit for total pixels being altered.
 MAX_TOTAL_MASK_RATIO = 0.15
 
 
 # ============================================================
-# GIF TEMPORAL SETTINGS
+# GIF PULSING SETTINGS
 # ============================================================
 
 TEMPORAL_DIFF_THRESHOLD = 16
@@ -142,7 +140,7 @@ logger.info("━━━━━━━━━━━━━━━━━━━━━━�
 logger.info("🧹 WATERMARK PROCESSOR STARTED")
 logger.info("🧹 OpenAI Vision: DISABLED")
 logger.info("🧹 Image generation: DISABLED")
-logger.info("🔴 Strong/faded red detection: ENABLED")
+logger.info("🔴 Strong/faded-red detection: ENABLED")
 logger.info("🟢 CF logo template detection: ENABLED")
 logger.info("🎞️ GIF pulsing detection: ENABLED")
 logger.info("🧹 Direct OpenCV inpainting: ENABLED")
@@ -156,10 +154,10 @@ logger.info("━━━━━━━━━━━━━━━━━━━━━━�
 
 def replace_username(text: str) -> str:
     """
-    Existing caption behavior:
+    Existing caption behavior.
 
     1. Remove *
-    2. Replace @cappersfree with NEW_MENTION
+    2. Replace OLD_MENTION with NEW_MENTION
 
     Nothing else.
     """
@@ -170,13 +168,16 @@ def replace_username(text: str) -> str:
     result = text.replace("*", "")
 
     if NEW_MENTION:
+
         result = re.sub(
             re.escape(OLD_MENTION),
             NEW_MENTION,
             result,
             flags=re.IGNORECASE,
         )
+
     else:
+
         logger.warning(
             "⚠️ NEW_MENTION is empty."
         )
@@ -192,13 +193,37 @@ async def rewrite_text(
         original_text
     )
 
-    logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    logger.info("📝 CAPTION PROCESSING")
-    logger.info("📝 ORIGINAL: %r", original_text)
-    logger.info("📝 FINAL:    %r", result)
-    logger.info("👤 OLD:      %r", OLD_MENTION)
-    logger.info("👤 NEW:      %r", NEW_MENTION)
-    logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    logger.info(
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    logger.info(
+        "📝 CAPTION PROCESSING"
+    )
+
+    logger.info(
+        "📝 ORIGINAL: %r",
+        original_text,
+    )
+
+    logger.info(
+        "📝 FINAL:    %r",
+        result,
+    )
+
+    logger.info(
+        "👤 OLD:      %r",
+        OLD_MENTION,
+    )
+
+    logger.info(
+        "👤 NEW:      %r",
+        NEW_MENTION,
+    )
+
+    logger.info(
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
 
     return result
 
@@ -221,7 +246,10 @@ def is_video_container(
     data: bytes,
 ) -> bool:
 
-    if len(data) >= 12 and data[4:8] == b"ftyp":
+    if (
+        len(data) >= 12
+        and data[4:8] == b"ftyp"
+    ):
         return True
 
     if data.startswith(
@@ -236,7 +264,9 @@ def pil_to_bgr(
     image: Image.Image,
 ) -> np.ndarray:
 
-    rgb = image.convert("RGB")
+    rgb = image.convert(
+        "RGB"
+    )
 
     return cv2.cvtColor(
         np.asarray(rgb),
@@ -259,20 +289,17 @@ def bgr_to_pil(
 
 
 # ============================================================
-# RED DETECTION
+# RED / FADED-RED DETECTION
 # ============================================================
 
 def detect_red_pixels(
     frame: np.ndarray,
 ) -> np.ndarray:
     """
-    Detect both normal and faded red.
+    Detect normal and faded red.
 
-    This uses:
-        - HSV hue
-        - red-channel dominance
-
-    The latter is important for translucent/faded red text.
+    Uses both HSV and actual RGB channel dominance, because a
+    translucent red watermark may have relatively low saturation.
     """
 
     hsv = cv2.cvtColor(
@@ -300,9 +327,9 @@ def detect_red_pixels(
         )
     )
 
-    # ----------------------------------------
-    # HSV red
-    # ----------------------------------------
+    # --------------------------------------------------------
+    # Strong red.
+    # --------------------------------------------------------
 
     strong_1 = cv2.inRange(
         hsv,
@@ -344,9 +371,14 @@ def detect_red_pixels(
         ),
     )
 
-    # ----------------------------------------
-    # Faded red
-    # ----------------------------------------
+    strong = cv2.bitwise_or(
+        strong_1,
+        strong_2,
+    )
+
+    # --------------------------------------------------------
+    # Faded red.
+    # --------------------------------------------------------
 
     faded_1 = cv2.inRange(
         hsv,
@@ -388,47 +420,41 @@ def detect_red_pixels(
         ),
     )
 
-    hsv_red = cv2.bitwise_or(
-        strong_1,
-        strong_2,
-    )
-
-    hsv_faded = cv2.bitwise_or(
+    faded = cv2.bitwise_or(
         faded_1,
         faded_2,
     )
 
-    # ----------------------------------------
-    # Red dominance
-    # ----------------------------------------
+    # --------------------------------------------------------
+    # Red-channel dominance.
+    # --------------------------------------------------------
 
-    dominance_mask = np.where(
-        red_dominance
-        >= RED_DOMINANCE_MIN,
+    dominance = np.where(
+        red_dominance >= RED_DOMINANCE_MIN,
         255,
         0,
-    ).astype(np.uint8)
-
-    # Red pixels need either HSV evidence or
-    # strong red-channel dominance.
-    combined = cv2.bitwise_or(
-        hsv_faded,
-        dominance_mask,
+    ).astype(
+        np.uint8
     )
 
-    # Remove obvious grayscale/near-white noise.
-    low_saturation = hsv[:, :, 1] < 18
+    combined = cv2.bitwise_or(
+        strong,
+        faded,
+    )
 
+    combined = cv2.bitwise_or(
+        combined,
+        dominance,
+    )
+
+    # Very low saturation pixels are generally grey/white and
+    # should not be treated as red watermark pixels.
     combined[
-        low_saturation
+        hsv[:, :, 1] < 18
     ] = 0
 
     return combined
 
-
-# ============================================================
-# FIND FIELDS THAT LOOK LIKE RED TEXT
-# ============================================================
 
 def detect_red_text_mask(
     frame: np.ndarray,
@@ -440,19 +466,14 @@ def detect_red_text_mask(
 
     h, w = red.shape
 
-    # ----------------------------------------
-    # Morphological grouping.
-    #
-    # This joins individual letters into a
-    # text-shaped region.
-    # ----------------------------------------
-
-    text_kernel = cv2.getStructuringElement(
-        cv2.MORPH_RECT,
-        (
-            RED_TEXT_KERNEL_WIDTH,
-            RED_TEXT_KERNEL_HEIGHT,
-        ),
+    text_kernel = (
+        cv2.getStructuringElement(
+            cv2.MORPH_RECT,
+            (
+                RED_TEXT_KERNEL_WIDTH,
+                RED_TEXT_KERNEL_HEIGHT,
+            ),
+        )
     )
 
     grouped = cv2.morphologyEx(
@@ -469,10 +490,6 @@ def detect_red_text_mask(
         ),
         iterations=1,
     )
-
-    # ----------------------------------------
-    # Connected components.
-    # ----------------------------------------
 
     count, labels, stats, _ = (
         cv2.connectedComponentsWithStats(
@@ -520,32 +537,30 @@ def detect_red_text_mask(
 
         if (
             area
-            >
-            h * w
+            > h
+            * w
             * MAX_RED_COMPONENT_RATIO
         ):
             continue
 
-        # ------------------------------------
-        # @cappersfree is textual, so favor
-        # horizontally-oriented regions.
-        # ------------------------------------
-
+        # Watermark text should generally be wider than tall.
         if ww < 20:
             continue
 
         if hh > h * 0.25:
             continue
 
-        aspect = ww / max(
-            1,
-            hh,
+        aspect = (
+            ww
+            / max(
+                1,
+                hh,
+            )
         )
 
         if aspect < 2.0:
             continue
 
-        # Don't allow a huge region.
         if ww > w * 0.70:
             continue
 
@@ -557,15 +572,10 @@ def detect_red_text_mask(
 
 
 # ============================================================
-# LOGO TEMPLATE LOADING
+# CF LOGO TEMPLATE
 # ============================================================
 
 def load_cf_logo():
-    """
-    Load assets/watermarks/cf_logo.png.
-
-    The image should be a tight crop around the CF graphic.
-    """
 
     if not CF_LOGO_PATH.exists():
 
@@ -580,7 +590,9 @@ def load_cf_logo():
 
         logo = Image.open(
             CF_LOGO_PATH
-        ).convert("RGBA")
+        ).convert(
+            "RGBA"
+        )
 
         rgba = np.asarray(
             logo
@@ -591,7 +603,7 @@ def load_cf_logo():
         alpha = rgba[:, :, 3]
 
         # ----------------------------------------------------
-        # Crop transparent border.
+        # Crop transparent borders.
         # ----------------------------------------------------
 
         ys, xs = np.where(
@@ -609,10 +621,6 @@ def load_cf_logo():
                 ys.min():ys.max() + 1,
                 xs.min():xs.max() + 1,
             ]
-
-        # ----------------------------------------------------
-        # White composite for matching.
-        # ----------------------------------------------------
 
         alpha_f = (
             alpha.astype(
@@ -654,20 +662,17 @@ def load_cf_logo():
             cv2.COLOR_RGB2BGR,
         )
 
-        # Actual alpha mask.
-        if np.any(
-            alpha > 10
-        ):
+        logo_mask = np.where(
+            alpha > 10,
+            255,
+            0,
+        ).astype(
+            np.uint8
+        )
 
-            logo_mask = np.where(
-                alpha > 10,
-                255,
-                0,
-            ).astype(
-                np.uint8
-            )
-
-        else:
+        if cv2.countNonZero(
+            logo_mask
+        ) == 0:
 
             logo_mask = np.ones(
                 alpha.shape,
@@ -704,12 +709,6 @@ CF_LOGO = load_cf_logo()
 def find_cf_logo_matches(
     frame: np.ndarray,
 ):
-    """
-    Find CF logo using multi-scale template matching.
-
-    Matching is performed primarily against edges so the logo
-    can still be found when its opacity changes.
-    """
 
     if CF_LOGO is None:
         return []
@@ -759,11 +758,13 @@ def find_cf_logo_matches(
     for scale in LOGO_SCALES:
 
         w = int(
-            template_w * scale
+            template_w
+            * scale
         )
 
         h = int(
-            template_h * scale
+            template_h
+            * scale
         )
 
         if w < 8 or h < 8:
@@ -774,7 +775,10 @@ def find_cf_logo_matches(
 
         resized = cv2.resize(
             template_edges,
-            (w, h),
+            (
+                w,
+                h,
+            ),
             interpolation=(
                 cv2.INTER_AREA
                 if scale < 1
@@ -791,10 +795,11 @@ def find_cf_logo_matches(
             )
 
         except Exception:
-
             continue
 
-        for _ in range(10):
+        for _ in range(
+            10
+        ):
 
             _, max_value, _, max_location = (
                 cv2.minMaxLoc(
@@ -818,12 +823,10 @@ def find_cf_logo_matches(
                         y,
                         x + w,
                         y + h,
-                        scale,
                     ),
                 )
             )
 
-            # Suppress this area.
             sx1 = max(
                 0,
                 x - w // 2,
@@ -850,7 +853,7 @@ def find_cf_logo_matches(
             ] = -1
 
     candidates.sort(
-        key=lambda item: item[0],
+        key=lambda x: x[0],
         reverse=True,
     )
 
@@ -858,13 +861,15 @@ def find_cf_logo_matches(
 
     for score, box in candidates:
 
-        x1, y1, x2, y2, scale = box
+        x1, y1, x2, y2 = box
 
         duplicate = False
 
         for _, existing in selected:
 
-            ex1, ey1, ex2, ey2, _ = existing
+            ex1, ey1, ex2, ey2 = (
+                existing
+            )
 
             ix1 = max(
                 x1,
@@ -914,7 +919,7 @@ def find_cf_logo_matches(
             len(selected),
         )
 
-        for score, box in selected:
+        for score, _ in selected:
 
             logger.info(
                 "🟢 CF logo confidence: %.3f",
@@ -928,26 +933,21 @@ def add_logo_matches_to_mask(
     frame: np.ndarray,
     mask: np.ndarray,
 ):
-    """
-    Add detected CF logo locations to the full-frame mask.
-    """
 
     if CF_LOGO is None:
         return
 
-    _, template_mask = CF_LOGO
+    _, template_mask = (
+        CF_LOGO
+    )
 
     matches = find_cf_logo_matches(
         frame
     )
 
-    for _, (
-        x1,
-        y1,
-        x2,
-        y2,
-        _,
-    ) in matches:
+    for _, box in matches:
+
+        x1, y1, x2, y2 = box
 
         x1 = max(
             0,
@@ -969,19 +969,24 @@ def add_logo_matches_to_mask(
             y2,
         )
 
-        if x2 <= x1 or y2 <= y1:
+        if (
+            x2 <= x1
+            or y2 <= y1
+        ):
             continue
 
-        w = x2 - x1
-        h = y2 - y1
+        width = x2 - x1
+        height = y2 - y1
 
         resized_mask = cv2.resize(
             template_mask,
-            (w, h),
+            (
+                width,
+                height,
+            ),
             interpolation=cv2.INTER_NEAREST,
         )
 
-        # Slight expansion for faded edges.
         resized_mask = cv2.dilate(
             resized_mask,
             cv2.getStructuringElement(
@@ -1004,20 +1009,12 @@ def add_logo_matches_to_mask(
 
 
 # ============================================================
-# GIF PULSING DETECTION
+# GIF PULSE DETECTION
 # ============================================================
 
 def learn_pulsing_cf_region(
     frames,
 ):
-    """
-    Learn a fixed CF region from a GIF.
-
-    The logo is assumed to stay in one location but pulse/fade.
-    """
-
-    if not frames:
-        return None
 
     if len(frames) < 3:
         return None
@@ -1048,7 +1045,10 @@ def learn_pulsing_cf_region(
 
         gray = cv2.GaussianBlur(
             gray,
-            (5, 5),
+            (
+                5,
+                5,
+            ),
             0,
         )
 
@@ -1069,13 +1069,14 @@ def learn_pulsing_cf_region(
         len(gray_frames),
     ):
 
-        diff = cv2.absdiff(
-            gray_frames[i],
-            gray_frames[i - 1],
-        )
-
-        difference += diff.astype(
-            np.float32
+        difference += (
+            cv2.absdiff(
+                gray_frames[i],
+                gray_frames[i - 1],
+            )
+            .astype(
+                np.float32
+            )
         )
 
     difference /= (
@@ -1095,7 +1096,6 @@ def learn_pulsing_cf_region(
         >= TEMPORAL_DIFF_THRESHOLD
     ] = 255
 
-    # Join parts of a pulsing logo.
     close_kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE,
         (
@@ -1115,7 +1115,10 @@ def learn_pulsing_cf_region(
         cv2.MORPH_OPEN,
         cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE,
-            (5, 5),
+            (
+                5,
+                5,
+            ),
         ),
     )
 
@@ -1129,8 +1132,6 @@ def learn_pulsing_cf_region(
     mask = np.zeros_like(
         dynamic
     )
-
-    total_area = 0
 
     for i in range(
         1,
@@ -1168,7 +1169,8 @@ def learn_pulsing_cf_region(
         if (
             area
             >
-            h * w
+            h
+            * w
             * TEMPORAL_MAX_AREA_RATIO
         ):
             continue
@@ -1193,17 +1195,20 @@ def learn_pulsing_cf_region(
             -1,
         )
 
-        total_area += area
+    if cv2.countNonZero(
+        mask
+    ) == 0:
 
-    if total_area == 0:
         return None
 
-    # Final expansion for faint pulse edges.
     mask = cv2.dilate(
         mask,
         cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE,
-            (7, 7),
+            (
+                7,
+                7,
+            ),
         ),
         iterations=1,
     )
@@ -1216,6 +1221,7 @@ def learn_pulsing_cf_region(
     )
 
     if ratio > MAX_TOTAL_MASK_RATIO:
+
         logger.warning(
             "⚠️ Learned GIF mask too large: %.2f%%",
             ratio * 100,
@@ -1232,13 +1238,13 @@ def learn_pulsing_cf_region(
 
 
 # ============================================================
-# FINAL MASK VALIDATION
+# MASK VALIDATION
 # ============================================================
 
 def validate_mask(
-    mask: np.ndarray,
+    mask: np.ndarray | None,
     frame_shape,
-) -> np.ndarray | None:
+):
 
     if mask is None:
         return None
@@ -1281,9 +1287,6 @@ def inpaint_frame(
     mask: np.ndarray | None,
 ) -> np.ndarray:
 
-    if mask is None:
-        return frame
-
     mask = validate_mask(
         mask,
         frame.shape,
@@ -1313,12 +1316,12 @@ def inpaint_frame(
 
 
 # ============================================================
-# BUILD STATIC MASK
+# BUILD MASK FOR ONE STATIC FRAME
 # ============================================================
 
-def build_static_mask(
+def build_frame_mask(
     frame: np.ndarray,
-) -> np.ndarray | None:
+):
 
     mask = np.zeros(
         frame.shape[:2],
@@ -1326,7 +1329,7 @@ def build_static_mask(
     )
 
     # --------------------------------------------------------
-    # Red / faded-red watermark.
+    # RED / FADED RED
     # --------------------------------------------------------
 
     red_mask = detect_red_text_mask(
@@ -1350,10 +1353,10 @@ def build_static_mask(
         )
 
     # --------------------------------------------------------
-    # CF logo template.
+    # CF LOGO
     # --------------------------------------------------------
 
-    before_logo = cv2.countNonZero(
+    before = cv2.countNonZero(
         mask
     )
 
@@ -1362,15 +1365,15 @@ def build_static_mask(
         mask,
     )
 
-    after_logo = cv2.countNonZero(
+    after = cv2.countNonZero(
         mask
     )
 
-    if after_logo > before_logo:
+    if after > before:
 
         logger.info(
             "🟢 CF logo mask added: %d pixels",
-            after_logo - before_logo,
+            after - before,
         )
 
     return validate_mask(
@@ -1399,14 +1402,14 @@ def process_static_image(
             source
         )
 
-        mask = build_static_mask(
+        mask = build_frame_mask(
             frame
         )
 
         if mask is None:
 
             logger.info(
-                "ℹ️ No reliable CF/@cappersfree mark detected. "
+                "ℹ️ No reliable watermark detected. "
                 "Returning original image unchanged."
             )
 
@@ -1481,7 +1484,7 @@ def process_static_image(
 
 
 # ============================================================
-# GIF
+# ACTUAL GIF
 # ============================================================
 
 def process_gif(
@@ -1527,16 +1530,15 @@ def process_gif(
             )
 
         if not frames:
-
             return None
 
         logger.info(
-            "🎞️ GIF frames: %d",
+            "🎞️ GIF contains %d frame(s).",
             len(frames),
         )
 
         # --------------------------------------------------------
-        # Learn fixed pulsing CF area.
+        # Learn pulsing CF region.
         # --------------------------------------------------------
 
         temporal_mask = (
@@ -1551,17 +1553,13 @@ def process_gif(
                 "🧠 Pulsing CF mask learned."
             )
 
-        # --------------------------------------------------------
-        # Process every frame.
-        # --------------------------------------------------------
-
         cleaned_frames = []
 
         for index, frame in enumerate(
             frames
         ):
 
-            mask = build_static_mask(
+            mask = build_frame_mask(
                 frame
             )
 
@@ -1597,10 +1595,6 @@ def process_gif(
                 len(frames),
             )
 
-        # --------------------------------------------------------
-        # Rebuild GIF.
-        # --------------------------------------------------------
-
         output = io.BytesIO()
 
         cleaned_frames[0].save(
@@ -1613,9 +1607,7 @@ def process_gif(
             optimize=False,
         )
 
-        cleaned_bytes = (
-            output.getvalue()
-        )
+        cleaned_bytes = output.getvalue()
 
         logger.info(
             "✅ GIF cleaned: %d bytes",
@@ -1655,7 +1647,7 @@ def process_mp4(
     except Exception:
 
         logger.exception(
-            "❌ imageio-ffmpeg is unavailable."
+            "❌ imageio-ffmpeg unavailable."
         )
 
         return None
@@ -1687,7 +1679,7 @@ def process_mp4(
                 / "frame_%06d.png"
             )
 
-            command = [
+            extract_command = [
                 ffmpeg,
                 "-y",
                 "-i",
@@ -1698,7 +1690,7 @@ def process_mp4(
             ]
 
             result = subprocess.run(
-                command,
+                extract_command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 timeout=180,
@@ -1723,7 +1715,6 @@ def process_mp4(
             )
 
             if not frame_paths:
-
                 return None
 
             frames = []
@@ -1742,11 +1733,10 @@ def process_mp4(
                     )
 
             if not frames:
-
                 return None
 
             logger.info(
-                "🎞️ MP4 frames: %d",
+                "🎞️ MP4 contains %d frame(s).",
                 len(frames),
             )
 
@@ -1766,7 +1756,7 @@ def process_mp4(
                 start=1,
             ):
 
-                mask = build_static_mask(
+                mask = build_frame_mask(
                     frame
                 )
 
@@ -1807,8 +1797,7 @@ def process_mp4(
                 / "cleaned.mp4"
             )
 
-            # Keep a reasonable GIF-like frame rate.
-            command = [
+            encode_command = [
                 ffmpeg,
                 "-y",
                 "-framerate",
@@ -1817,6 +1806,10 @@ def process_mp4(
                 str(processed_pattern),
                 "-c:v",
                 "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "18",
                 "-pix_fmt",
                 "yuv420p",
                 "-movflags",
@@ -1825,7 +1818,7 @@ def process_mp4(
             ]
 
             result = subprocess.run(
-                command,
+                encode_command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 timeout=180,
@@ -1848,7 +1841,7 @@ def process_mp4(
             )
 
             logger.info(
-                "✅ MP4/GIF cleaned: %d bytes",
+                "✅ MP4 cleaned: %d bytes",
                 len(cleaned_bytes),
             )
 
@@ -1867,7 +1860,7 @@ def process_mp4(
 
 
 # ============================================================
-# MAIN PUBLIC FUNCTION
+# PUBLIC ENTRY POINT
 # ============================================================
 
 async def remove_watermarks_from_bytes(
@@ -1876,15 +1869,16 @@ async def remove_watermarks_from_bytes(
     mime_type: str = "",
 ):
     """
-    Main entry point.
+    Main entry point used by main.py.
 
-    There is NO:
-        OpenAI Vision
-        image generation
-        reconstruction
-        AI rewriting
+    IMPORTANT:
+    This ALWAYS returns an aiogram BufferedInputFile.
 
-    Only direct pixel-level watermark removal.
+    It does NOT return:
+        (bytes, "photo")
+
+    This fixes the aiogram validation error from the previous
+    deployment.
     """
 
     if not image_bytes:
@@ -1925,39 +1919,81 @@ async def remove_watermarks_from_bytes(
 
     try:
 
-        # --------------------------------------------------------
-        # Actual GIF.
-        # --------------------------------------------------------
+        # ====================================================
+        # ACTUAL GIF
+        # ====================================================
 
         if is_gif(
             image_bytes
         ):
 
-            return await asyncio.to_thread(
+            logger.info(
+                "🎞️ Actual GIF detected."
+            )
+
+            result = await asyncio.to_thread(
                 process_gif,
                 image_bytes,
             )
 
-        # --------------------------------------------------------
-        # Telegram GIF/video.
-        # --------------------------------------------------------
+            if not result:
+                return None
+
+            cleaned_bytes, _ = result
+
+            return BufferedInputFile(
+                cleaned_bytes,
+                filename="watermark_removed.gif",
+            )
+
+        # ====================================================
+        # MP4 / TELEGRAM GIF
+        # ====================================================
 
         if is_video_container(
             image_bytes
         ):
 
-            return await asyncio.to_thread(
+            logger.info(
+                "🎞️ MP4/video container detected."
+            )
+
+            result = await asyncio.to_thread(
                 process_mp4,
                 image_bytes,
             )
 
-        # --------------------------------------------------------
-        # Normal image.
-        # --------------------------------------------------------
+            if not result:
+                return None
 
-        return await asyncio.to_thread(
+            cleaned_bytes, _ = result
+
+            return BufferedInputFile(
+                cleaned_bytes,
+                filename="watermark_removed.mp4",
+            )
+
+        # ====================================================
+        # STATIC IMAGE
+        # ====================================================
+
+        logger.info(
+            "🖼️ Static image detected."
+        )
+
+        result = await asyncio.to_thread(
             process_static_image,
             image_bytes,
+        )
+
+        if not result:
+            return None
+
+        cleaned_bytes, _ = result
+
+        return BufferedInputFile(
+            cleaned_bytes,
+            filename="watermark_removed.png",
         )
 
     except Exception:
@@ -1980,7 +2016,7 @@ async def remove_watermarks_from_bytes(
 
 
 # ============================================================
-# COMPATIBILITY
+# BACKWARD COMPATIBILITY
 # ============================================================
 
 async def regenerate_image_from_bytes(
