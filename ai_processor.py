@@ -9,7 +9,7 @@ import subprocess
 
 from pathlib import Path
 
-from PIL import Image, ImageSequence
+from PIL import Image
 from openai import OpenAI, RateLimitError
 from aiogram.types import BufferedInputFile
 
@@ -22,7 +22,7 @@ logger = logging.getLogger("ai_processor")
 
 
 # ============================================================
-# ENVIRONMENT
+# OPENAI ENVIRONMENT
 # ============================================================
 
 OPENAI_API_KEY = os.getenv(
@@ -31,10 +31,13 @@ OPENAI_API_KEY = os.getenv(
 ).strip()
 
 if not OPENAI_API_KEY:
-    logger.error(
-        "❌ OPENAI_API_KEY is missing."
-    )
+    logger.error("❌ OPENAI_API_KEY is missing.")
 
+
+# IMPORTANT:
+# max_retries=0 prevents the SDK from repeatedly retrying
+# requests that cannot succeed, such as exhausted credits or
+# invalid parameters.
 openai_client = (
     OpenAI(
         api_key=OPENAI_API_KEY,
@@ -67,7 +70,7 @@ if (
 
 
 # ============================================================
-# OPENAI CONFIGURATION
+# OPENAI IMAGE CONFIGURATION
 # ============================================================
 
 OPENAI_IMAGE_MODEL = os.getenv(
@@ -77,11 +80,6 @@ OPENAI_IMAGE_MODEL = os.getenv(
 
 OPENAI_IMAGE_QUALITY = os.getenv(
     "OPENAI_IMAGE_QUALITY",
-    "high",
-).strip()
-
-OPENAI_INPUT_FIDELITY = os.getenv(
-    "OPENAI_INPUT_FIDELITY",
     "high",
 ).strip()
 
@@ -97,7 +95,7 @@ OPENAI_EDIT_MAX_ATTEMPTS = max(
 
 
 # ============================================================
-# VERIFICATION
+# VERIFICATION CONFIGURATION
 # ============================================================
 
 WATERMARK_VERIFICATION_ENABLED = (
@@ -168,14 +166,13 @@ logger.info(
 )
 
 if WATERMARK_VERIFICATION_ENABLED:
-
     logger.info(
         "🔎 Verification model: %s",
         WATERMARK_VERIFY_MODEL,
     )
 
 logger.info(
-    "🎞️ GIF → representative still → OpenAI edit"
+    "🎞️ GIF/MP4 workflow: representative still"
 )
 
 logger.info(
@@ -202,7 +199,6 @@ logger.info(
 def replace_username(
     text: str,
 ) -> str:
-
     """
     ONLY:
 
@@ -363,17 +359,18 @@ def decode_image(
 
 
 # ============================================================
-# GIF FRAME SCORING
+# FRAME SCORING
 # ============================================================
 
 def score_frame(
     image: Image.Image,
 ) -> float:
-
     """
-    Frame selection only.
+    This is ONLY used to choose a representative frame.
 
-    This does NOT remove the watermark.
+    It is NOT a watermark detector.
+
+    Lower score is preferred.
     """
 
     try:
@@ -422,10 +419,6 @@ def score_frame(
         return 0.0
 
 
-# ============================================================
-# CHOOSE GIF FRAME
-# ============================================================
-
 def choose_best_frame(
     frames,
 ):
@@ -452,22 +445,22 @@ def choose_best_frame(
         key=lambda item: item[0]
     )
 
-    score, index, frame = (
+    best_score, best_index, best_frame = (
         scored[0]
     )
 
     logger.info(
         "🎯 Representative frame selected: %d "
         "(score %.6f)",
-        index,
-        score,
+        best_index,
+        best_score,
     )
 
-    return frame
+    return best_frame
 
 
 # ============================================================
-# ACTUAL GIF
+# GIF FRAME EXTRACTION
 # ============================================================
 
 def extract_best_gif_frame(
@@ -552,6 +545,7 @@ def extract_best_gif_frame(
                 )
 
         if not frames:
+
             return None
 
         return choose_best_frame(
@@ -568,7 +562,7 @@ def extract_best_gif_frame(
 
 
 # ============================================================
-# MP4 / TELEGRAM GIF
+# MP4 / TELEGRAM GIF FRAME EXTRACTION
 # ============================================================
 
 def extract_best_mp4_frame(
@@ -622,14 +616,12 @@ def extract_best_mp4_frame(
 
             # IMPORTANT:
             #
-            # Do not use:
+            # Use a simple valid FFmpeg filter.
+            #
+            # Do NOT use:
             #     fps=min(12,1000)
             #
-            # That was the source of the FFmpeg
-            # "No such filter: 1000)" error.
-            #
-            # We simply sample at 4 fps and cap the
-            # number of frames.
+            # because FFmpeg interprets that incorrectly.
             command = [
                 ffmpeg,
                 "-y",
@@ -643,6 +635,10 @@ def extract_best_mp4_frame(
                 ),
                 output_pattern,
             ]
+
+            logger.info(
+                "🎞️ Running FFmpeg frame extraction..."
+            )
 
             result = subprocess.run(
                 command,
@@ -661,7 +657,7 @@ def extract_best_mp4_frame(
                     result.stderr.decode(
                         "utf-8",
                         errors="replace",
-                    )[-3000:]
+                    )[-5000:]
                 )
 
                 return None
@@ -704,11 +700,12 @@ def extract_best_mp4_frame(
                 except Exception:
 
                     logger.exception(
-                        "⚠️ Could not read %s",
+                        "⚠️ Could not read frame %s",
                         path,
                     )
 
             if not frames:
+
                 return None
 
             logger.info(
@@ -730,7 +727,7 @@ def extract_best_mp4_frame(
 
 
 # ============================================================
-# PREPARE REPRESENTATIVE STILL
+# PREPARE STILL
 # ============================================================
 
 def prepare_still_image(
@@ -738,7 +735,12 @@ def prepare_still_image(
 ):
 
     if not image_bytes:
+
         return None
+
+    # --------------------------------------------------------
+    # GIF
+    # --------------------------------------------------------
 
     if is_gif(
         image_bytes
@@ -753,11 +755,16 @@ def prepare_still_image(
         )
 
         if frame is None:
+
             return None
 
         return pil_to_png_bytes(
             frame
         )
+
+    # --------------------------------------------------------
+    # MP4 / video
+    # --------------------------------------------------------
 
     if is_video_container(
         image_bytes
@@ -772,17 +779,23 @@ def prepare_still_image(
         )
 
         if frame is None:
+
             return None
 
         return pil_to_png_bytes(
             frame
         )
 
+    # --------------------------------------------------------
+    # Normal image
+    # --------------------------------------------------------
+
     image = decode_image(
         image_bytes
     )
 
     if image is None:
+
         return None
 
     return pil_to_png_bytes(
@@ -798,28 +811,32 @@ WATERMARK_EDIT_PROMPT = """
 Perform a precise image cleanup.
 
 REMOVE ONLY:
-1. every visible, faint, translucent, partial, or stylized
-   "@cappersfree" / "cappersfree" watermark
+
+1. every visible, faint, translucent, partial, faded, or
+   stylized "@cappersfree" / "cappersfree" watermark
+
 2. every CF graphic/logo associated with that watermark
 
-This is NOT a redesign.
+This is NOT a redesign and NOT a full recreation.
 
 Reconstruct the background/content underneath the removed
-watermark naturally.
+watermark naturally so the result looks clean and professional.
 
-Preserve everything else as faithfully as possible:
+PRESERVE AS MUCH OF THE SOURCE AS POSSIBLE:
+
 - legitimate text
 - scores
 - odds
 - numbers
 - dates
-- teams
-- players
+- team names
+- player names
 - faces
 - people
 - uniforms
 - unrelated icons
 - typography
+- font appearance
 - colors
 - gradients
 - shadows
@@ -830,51 +847,82 @@ Preserve everything else as faithfully as possible:
 - layout
 - aspect ratio
 
-Do NOT:
+DO NOT:
+
 - crop
+- resize unnecessarily
 - redesign
 - rewrite legitimate text
-- change numbers
+- change legitimate numbers
 - change scores
 - change odds
-- change people
-- add logos
-- add usernames
+- change names
+- change players
+- change faces
+- add another logo
+- add another username
 - add branding
-- replace the watermark with another graphic
-- blur the watermark area
+- add a watermark
+- replace the CF watermark with another graphic
+- blur the removed area
+- leave a visible patch or blank region
 
-The ONLY intended modification is removal of the
-CF graphic/logo and @cappersfree watermark.
+The ONLY requested modification is:
+
+REMOVE THE CF GRAPHIC/LOGO AND @CAPPERSFREE WATERMARK.
+
+Everything else should remain visually faithful to the source.
 """
 
 
 WATERMARK_RETRY_PROMPT = """
-The previous result was rejected because the CF or
-@cappersfree watermark may still be visible.
+The previous edited result was rejected because the watermark
+was still visible or a faint/ghosted version may remain.
 
-Inspect the entire image again and remove:
-- strong @cappersfree
-- faint @cappersfree
+Perform another careful cleanup of the ENTIRE image.
+
+Look for all versions of:
+
+- @cappersfree
+- cappersfree
+- faded @cappersfree
 - translucent @cappersfree
-- partial cappersfree text
-- CF logos
-- faint CF graphics
-- ghosted remnants of the watermark
+- partial cappersfree
+- CF logo
+- faded CF logo
+- translucent CF logo
+- ghosted remnants
+
+Remove all of them.
 
 Reconstruct the underlying background naturally.
 
-Do not alter legitimate text, numbers, scores, odds,
-players, faces, colors, typography, composition, or layout.
+Do NOT alter legitimate:
+- text
+- numbers
+- scores
+- odds
+- names
+- players
+- faces
+- colors
+- typography
+- panels
+- layout
+- composition
+
 Do not redesign the image.
 """
 
 
 WATERMARK_VERIFICATION_PROMPT = """
-Inspect this edited image for the specific watermark we are
-trying to remove.
+You are the final quality-control checker for a watermark
+removal pipeline.
 
-Target:
+Inspect the provided edited image.
+
+The unwanted watermark is specifically:
+
 - CF graphic/logo
 - @cappersfree
 - cappersfree
@@ -883,9 +931,9 @@ Target:
 - partial versions
 - ghosted remnants
 
-Do not classify legitimate sports graphics as the watermark.
+DO NOT classify legitimate sports graphics as a watermark.
 
-Reply with EXACTLY one of:
+Reply with EXACTLY:
 
 CLEAN
 
@@ -893,10 +941,14 @@ or
 
 NOT_CLEAN
 
-Reply NOT_CLEAN if any target watermark remains or if you
-are uncertain.
+Reply NOT_CLEAN if:
+- any CF logo remains
+- any cappersfree text remains
+- any faint watermark remains
+- any ghosted watermark remains
+- you are uncertain
 
-Reply CLEAN only when the watermark is genuinely absent.
+Reply CLEAN only when the target watermark is genuinely absent.
 """
 
 
@@ -909,6 +961,7 @@ def is_valid_image_bytes(
 ) -> bool:
 
     if not image_bytes:
+
         return False
 
     try:
@@ -987,9 +1040,13 @@ def edit_image_with_openai(
         )
 
         # IMPORTANT:
-        # Do NOT add moderation=...
-        # The images.edit endpoint does not accept that
-        # argument in the SDK version being used.
+        #
+        # Do NOT pass:
+        #     input_fidelity
+        #     moderation
+        #
+        # They caused API 400 errors in the deployed
+        # version.
         response = (
             openai_client
             .images
@@ -999,7 +1056,6 @@ def edit_image_with_openai(
                 prompt=prompt,
                 size="auto",
                 quality=OPENAI_IMAGE_QUALITY,
-                input_fidelity=OPENAI_INPUT_FIDELITY,
                 output_format="png",
             )
         )
@@ -1019,7 +1075,7 @@ def edit_image_with_openai(
         ).lower()
 
         # ----------------------------------------------------
-        # ZERO API CREDITS / QUOTA
+        # Exhausted API credits.
         # ----------------------------------------------------
 
         if (
@@ -1047,25 +1103,19 @@ def edit_image_with_openai(
             )
 
             logger.error(
-                "❌ This is NOT an image-processing error."
-            )
-
-            logger.error(
-                "❌ The request cannot succeed until "
-                "API billing/credits are available."
+                "❌ This is a billing/quota issue, "
+                "not an image-processing issue."
             )
 
             logger.error(
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             )
 
-            # Special marker understood by the caller.
-            return "__OPENAI_CREDITS_EXHAUSTED__"
+            return (
+                "__OPENAI_CREDITS_EXHAUSTED__"
+            )
 
-        # ----------------------------------------------------
-        # Other rate limit.
-        # ----------------------------------------------------
-
+        # Other rate limits.
         logger.error(
             "❌ OpenAI rate limit error: %s",
             exc,
@@ -1075,7 +1125,17 @@ def edit_image_with_openai(
 
     except Exception as exc:
 
-        logger.exception(
+        status_code = getattr(
+            exc,
+            "status_code",
+            None,
+        )
+
+        error_text = str(
+            exc
+        )
+
+        logger.error(
             "❌ OpenAI image edit failed."
         )
 
@@ -1085,8 +1145,13 @@ def edit_image_with_openai(
         )
 
         logger.error(
+            "❌ Status: %s",
+            status_code,
+        )
+
+        logger.error(
             "❌ Error: %s",
-            str(exc),
+            error_text,
         )
 
         body = getattr(
@@ -1100,6 +1165,22 @@ def edit_image_with_openai(
             logger.error(
                 "❌ API BODY: %s",
                 body,
+            )
+
+        # ----------------------------------------------------
+        # 400 = invalid request/configuration.
+        #
+        # Do not retry an identical invalid request.
+        # ----------------------------------------------------
+
+        if status_code == 400:
+
+            logger.error(
+                "❌ OpenAI rejected the request parameters."
+            )
+
+            return (
+                "__OPENAI_BAD_REQUEST__"
             )
 
         return None
@@ -1147,7 +1228,7 @@ def edit_image_with_openai(
     except Exception:
 
         logger.exception(
-            "❌ Failed decoding OpenAI image."
+            "❌ Failed to decode OpenAI image."
         )
 
         return None
@@ -1161,7 +1242,7 @@ def edit_image_with_openai(
 
 
 # ============================================================
-# WATERMARK VERIFICATION
+# VERIFICATION
 # ============================================================
 
 def verify_watermark_is_removed(
@@ -1171,7 +1252,7 @@ def verify_watermark_is_removed(
     if not WATERMARK_VERIFICATION_ENABLED:
 
         logger.warning(
-            "⚠️ Watermark verification is disabled."
+            "⚠️ Watermark verification disabled."
         )
 
         return True
@@ -1316,7 +1397,7 @@ async def remove_watermarks_from_bytes(
     try:
 
         # ====================================================
-        # STEP 1 — STILL
+        # STEP 1 — PREPARE STILL
         # ====================================================
 
         logger.info(
@@ -1376,10 +1457,7 @@ async def remove_watermarks_from_bytes(
             )
 
             # ------------------------------------------------
-            # NO CREDITS.
-            #
-            # Do not make another attempt. There is nothing
-            # the code can do until the account has credits.
+            # Account has no credits.
             # ------------------------------------------------
 
             if (
@@ -1388,8 +1466,24 @@ async def remove_watermarks_from_bytes(
             ):
 
                 logger.error(
-                    "🚫 Stopping immediately because "
-                    "OpenAI API credits are exhausted."
+                    "🚫 Stopping because OpenAI API "
+                    "credits are exhausted."
+                )
+
+                return None
+
+            # ------------------------------------------------
+            # Invalid request parameters.
+            # ------------------------------------------------
+
+            if (
+                edited_bytes
+                == "__OPENAI_BAD_REQUEST__"
+            ):
+
+                logger.error(
+                    "🚫 Stopping because the OpenAI "
+                    "edit request was rejected."
                 )
 
                 return None
@@ -1416,6 +1510,10 @@ async def remove_watermarks_from_bytes(
             # STEP 3 — VERIFY
             # =================================================
 
+            logger.info(
+                "3️⃣ Verifying edited image..."
+            )
+
             verified = await asyncio.to_thread(
                 verify_watermark_is_removed,
                 edited_bytes,
@@ -1438,6 +1536,10 @@ async def remove_watermarks_from_bytes(
                 edited_bytes,
                 filename="cleaned.png",
             )
+
+        # ====================================================
+        # NOTHING VERIFIED
+        # ====================================================
 
         logger.error(
             "❌ No verified clean image was produced."
