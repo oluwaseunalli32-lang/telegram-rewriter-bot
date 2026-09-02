@@ -1,30 +1,24 @@
 import os
 import asyncio
 import logging
-
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 from aiogram import Bot
 from aiogram.types import (
+    BufferedInputFile,
     InputMediaPhoto,
+    InputMediaVideo,
 )
-
-from telethon import (
-    TelegramClient,
-    errors,
-)
+from telethon import TelegramClient, errors
 
 
 # ============================================================
-# LOAD ENVIRONMENT FIRST
+# LOAD ENVIRONMENT
 # ============================================================
 
-env_path = (
-    Path(__file__).parent
-    / ".env"
-)
+env_path = Path(__file__).parent / ".env"
 
 load_dotenv(
     dotenv_path=env_path
@@ -32,15 +26,10 @@ load_dotenv(
 
 
 # ============================================================
-# IMPORTS
+# DATABASE
 # ============================================================
 
 import database
-
-from ai_processor import (
-    rewrite_text,
-    remove_watermarks_from_bytes,
-)
 
 
 # ============================================================
@@ -57,18 +46,17 @@ logging.basicConfig(
     ),
 )
 
-logger = logging.getLogger(
-    __name__
-)
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# ENVIRONMENT
+# ENVIRONMENT VARIABLES
 # ============================================================
 
 BOT_TOKEN = os.getenv(
-    "BOT_TOKEN"
-)
+    "BOT_TOKEN",
+    "",
+).strip()
 
 API_ID = int(
     os.getenv(
@@ -78,12 +66,14 @@ API_ID = int(
 )
 
 API_HASH = os.getenv(
-    "API_HASH"
-)
+    "API_HASH",
+    "",
+).strip()
 
 PHONE = os.getenv(
-    "PHONE_NUMBER"
-)
+    "PHONE_NUMBER",
+    "",
+).strip()
 
 
 if (
@@ -101,7 +91,7 @@ if (
 
 
 # ============================================================
-# TELEGRAM
+# TELEGRAM CLIENTS
 # ============================================================
 
 bot = Bot(
@@ -116,16 +106,11 @@ user_client = TelegramClient(
 
 
 # ============================================================
-# CHANNELS
+# DEFAULT SOURCE/TARGET
 # ============================================================
 
-SOURCE_CHANNEL_ID = (
-    -1003593544389
-)
-
-TARGET_CHANNEL_ID = (
-    -1004415621706
-)
+SOURCE_CHANNEL_ID = -1003593544389
+TARGET_CHANNEL_ID = -1004415621706
 
 
 # ============================================================
@@ -146,6 +131,7 @@ last_processed = {}
 async def ensure_connection():
 
     if user_client.is_connected():
+
         return True
 
     logger.warning(
@@ -173,17 +159,103 @@ async def ensure_connection():
     except Exception:
 
         logger.exception(
-            "❌ Reconnection failed."
+            "❌ Telegram reconnection failed."
         )
 
     return False
 
 
 # ============================================================
+# CAPTION PROCESSING
+# ============================================================
+
+async def process_caption(
+    original_text: str,
+) -> str:
+
+    """
+    Caption behavior ONLY:
+
+    1. Remove *
+    2. Replace @cappersfree with NEW_MENTION
+
+    No AI.
+    No paraphrasing.
+    No rewriting.
+    """
+
+    old_mention = os.getenv(
+        "OLD_MENTION",
+        "@cappersfree",
+    ).strip()
+
+    new_mention = os.getenv(
+        "NEW_MENTION",
+        "",
+    ).strip()
+
+    if (
+        new_mention
+        and not new_mention.startswith("@")
+    ):
+        new_mention = "@" + new_mention
+
+    if not original_text:
+
+        return ""
+
+    result = original_text.replace(
+        "*",
+        "",
+    )
+
+    if new_mention:
+
+        import re
+
+        result = re.sub(
+            re.escape(old_mention),
+            new_mention,
+            result,
+            flags=re.IGNORECASE,
+        )
+
+    return result
+
+
+# ============================================================
+# MESSAGE TEXT
+# ============================================================
+
+def get_message_text(
+    msg,
+) -> str:
+
+    return (
+        getattr(
+            msg,
+            "text",
+            None,
+        )
+        or getattr(
+            msg,
+            "message",
+            None,
+        )
+        or getattr(
+            msg,
+            "caption",
+            None,
+        )
+        or ""
+    )
+
+
+# ============================================================
 # MEDIA DETECTION
 # ============================================================
 
-def get_image_media(
+def get_media(
     msg,
 ):
 
@@ -220,14 +292,13 @@ def get_image_media(
             or ""
         ).lower()
 
-        if mime_type.startswith(
-            "image/"
-        ):
-
-            return document
-
-        if mime_type.startswith(
-            "video/"
+        if (
+            mime_type.startswith(
+                "image/"
+            )
+            or mime_type.startswith(
+                "video/"
+            )
         ):
 
             return document
@@ -272,9 +343,7 @@ def get_image_media(
                 .lower()
             )
 
-            if extension in (
-                supported_extensions
-            ):
+            if extension in supported_extensions:
 
                 return document
 
@@ -282,12 +351,60 @@ def get_image_media(
 
 
 # ============================================================
-# FILE INFORMATION
+# MEDIA TYPE
 # ============================================================
 
-def get_media_filename(
+def get_media_type(
     msg,
-) -> str:
+):
+
+    document = getattr(
+        msg,
+        "document",
+        None,
+    )
+
+    if document:
+
+        mime_type = (
+            getattr(
+                document,
+                "mime_type",
+                "",
+            )
+            or ""
+        ).lower()
+
+        if mime_type.startswith(
+            "video/"
+        ):
+
+            return "video"
+
+        if mime_type in {
+            "image/gif",
+        }:
+
+            return "animation"
+
+    if getattr(
+        msg,
+        "photo",
+        None,
+    ):
+
+        return "photo"
+
+    return "document"
+
+
+# ============================================================
+# ORIGINAL MEDIA FILENAME
+# ============================================================
+
+def get_filename(
+    msg,
+):
 
     document = getattr(
         msg,
@@ -333,141 +450,245 @@ def get_media_filename(
     )
 
 
-def get_media_mime_type(
-    msg,
-) -> str:
-
-    document = getattr(
-        msg,
-        "document",
-        None,
-    )
-
-    if document:
-
-        return (
-            getattr(
-                document,
-                "mime_type",
-                "",
-            )
-            or ""
-        )
-
-    return "image/jpeg"
-
-
 # ============================================================
-# TEXT / CAPTION
+# DOWNLOAD ORIGINAL MEDIA
 # ============================================================
 
-def get_message_text(
-    msg,
-) -> str:
-
-    return (
-        getattr(
-            msg,
-            "text",
-            None,
-        )
-        or getattr(
-            msg,
-            "message",
-            None,
-        )
-        or getattr(
-            msg,
-            "caption",
-            None,
-        )
-        or ""
-    )
-
-
-# ============================================================
-# DOWNLOAD + OPENAI CLEANUP
-# ============================================================
-
-async def clean_message_media(
+async def download_original_media(
     msg,
 ):
 
-    media = get_image_media(
+    media = get_media(
         msg
     )
 
     if not media:
 
+        logger.error(
+            "❌ [%s] No supported media found.",
+            msg.id,
+        )
+
         return None
 
     logger.info(
-        "⬇️ [%s] Downloading media...",
+        "⬇️ [%s] Downloading ORIGINAL media...",
         msg.id,
     )
 
-    original_bytes = (
-        await user_client.download_media(
-            media,
-            bytes,
+    try:
+
+        media_bytes = (
+            await user_client.download_media(
+                media,
+                bytes,
+            )
         )
-    )
 
-    if not original_bytes:
+    except Exception:
 
-        logger.error(
+        logger.exception(
             "❌ [%s] Media download failed.",
             msg.id,
         )
 
         return None
 
-    logger.info(
-        "📦 [%s] Downloaded %d bytes.",
-        msg.id,
-        len(original_bytes),
-    )
-
-    filename = (
-        get_media_filename(
-            msg
-        )
-    )
-
-    mime_type = (
-        get_media_mime_type(
-            msg
-        )
-    )
-
-    logger.info(
-        "🤖 [%s] Sending media to OpenAI image editor...",
-        msg.id,
-    )
-
-    cleaned = (
-        await remove_watermarks_from_bytes(
-            image_bytes=original_bytes,
-            filename=filename,
-            mime_type=mime_type,
-        )
-    )
-
-    if not cleaned:
+    if not media_bytes:
 
         logger.error(
-            "❌ [%s] No verified clean image returned.",
+            "❌ [%s] Download returned no data.",
             msg.id,
         )
 
         return None
 
     logger.info(
-        "✅ [%s] Verified clean image ready.",
+        "📦 [%s] Original media: %d bytes",
         msg.id,
+        len(media_bytes),
     )
 
-    return cleaned
+    return media_bytes
+
+
+# ============================================================
+# PREPARE AIROGRAM FILE
+# ============================================================
+
+def make_input_file(
+    msg,
+    media_bytes: bytes,
+):
+
+    media_type = get_media_type(
+        msg
+    )
+
+    filename = get_filename(
+        msg
+    )
+
+    # --------------------------------------------------------
+    # Preserve GIF.
+    # --------------------------------------------------------
+
+    if media_type == "animation":
+
+        if not filename.lower().endswith(
+            ".gif"
+        ):
+
+            filename = (
+                "original.gif"
+            )
+
+    # --------------------------------------------------------
+    # Preserve MP4/video.
+    # --------------------------------------------------------
+
+    elif media_type == "video":
+
+        if not any(
+            filename.lower().endswith(
+                extension
+            )
+            for extension in (
+                ".mp4",
+                ".mov",
+                ".m4v",
+                ".webm",
+            )
+        ):
+
+            filename = (
+                "original.mp4"
+            )
+
+    # --------------------------------------------------------
+    # Normal photo.
+    # --------------------------------------------------------
+
+    elif media_type == "photo":
+
+        filename = (
+            "original.jpg"
+        )
+
+    return BufferedInputFile(
+        media_bytes,
+        filename=filename,
+    )
+
+
+# ============================================================
+# SEND ORIGINAL MEDIA
+# ============================================================
+
+async def send_original_media(
+    msg,
+    target_id,
+    caption,
+):
+
+    media = get_media(
+        msg
+    )
+
+    if not media:
+
+        return False
+
+    media_bytes = (
+        await download_original_media(
+            msg
+        )
+    )
+
+    if not media_bytes:
+
+        return False
+
+    media_type = get_media_type(
+        msg
+    )
+
+    input_file = make_input_file(
+        msg,
+        media_bytes,
+    )
+
+    final_caption = (
+        caption[:1024]
+        if caption
+        else None
+    )
+
+    try:
+
+        # ====================================================
+        # PHOTO
+        # ====================================================
+
+        if media_type == "photo":
+
+            await bot.send_photo(
+                chat_id=target_id,
+                photo=input_file,
+                caption=final_caption,
+            )
+
+        # ====================================================
+        # GIF / ANIMATION
+        # ====================================================
+
+        elif media_type == "animation":
+
+            await bot.send_animation(
+                chat_id=target_id,
+                animation=input_file,
+                caption=final_caption,
+            )
+
+        # ====================================================
+        # VIDEO
+        # ====================================================
+
+        elif media_type == "video":
+
+            await bot.send_video(
+                chat_id=target_id,
+                video=input_file,
+                caption=final_caption,
+            )
+
+        # ====================================================
+        # OTHER DOCUMENT
+        # ====================================================
+
+        else:
+
+            await bot.send_document(
+                chat_id=target_id,
+                document=input_file,
+                caption=final_caption,
+            )
+
+        logger.info(
+            "✅ [%s] ORIGINAL media reposted.",
+            msg.id,
+        )
+
+        return True
+
+    except Exception:
+
+        logger.exception(
+            "❌ [%s] Failed to send original media.",
+            msg.id,
+        )
+
+        return False
 
 
 # ============================================================
@@ -479,6 +700,15 @@ async def process_single_message(
     target_id,
 ):
 
+    logger.info(
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    logger.info(
+        "📩 Processing message %s",
+        msg.id,
+    )
+
     original_text = (
         get_message_text(
             msg
@@ -486,20 +716,36 @@ async def process_single_message(
     )
 
     # --------------------------------------------------------
-    # CAPTION:
-    # ONLY your existing * removal + username replacement.
+    # Caption ONLY.
     # --------------------------------------------------------
 
-    caption = await rewrite_text(
+    caption = await process_caption(
         original_text
     )
 
-    media = get_image_media(
+    if original_text != caption:
+
+        logger.info(
+            "✏️ [%s] Caption updated.",
+            msg.id,
+        )
+
+        logger.info(
+            "📝 Original: %r",
+            original_text,
+        )
+
+        logger.info(
+            "📝 Final: %r",
+            caption,
+        )
+
+    media = get_media(
         msg
     )
 
     # --------------------------------------------------------
-    # Text-only message.
+    # TEXT ONLY.
     # --------------------------------------------------------
 
     if not media:
@@ -512,42 +758,34 @@ async def process_single_message(
             )
 
             logger.info(
-                "✅ [%s] Text posted.",
+                "✅ [%s] Text message reposted.",
                 msg.id,
             )
 
         return True
 
     # --------------------------------------------------------
-    # Media.
+    # ORIGINAL MEDIA.
     # --------------------------------------------------------
 
-    cleaned = (
-        await clean_message_media(
-            msg
-        )
-    )
-
-    if not cleaned:
-
-        return False
-
-    await bot.send_photo(
-        chat_id=target_id,
-        photo=cleaned,
-        caption=(
-            caption[:1024]
-            if caption
-            else None
-        ),
-    )
-
     logger.info(
-        "✅ [%s] Clean image posted.",
+        "🖼️ [%s] MEDIA DETECTED",
         msg.id,
     )
 
-    return True
+    logger.info(
+        "⏸️ AI IMAGE GENERATION DISABLED"
+    )
+
+    logger.info(
+        "⏸️ WATERMARK REMOVAL DISABLED"
+    )
+
+    return await send_original_media(
+        msg,
+        target_id,
+        caption,
+    )
 
 
 # ============================================================
@@ -564,7 +802,7 @@ async def process_album(
     )
 
     logger.info(
-        "🖼️ TELEGRAM ALBUM: %d items",
+        "📚 TELEGRAM ALBUM: %d item(s)",
         len(messages),
     )
 
@@ -585,7 +823,7 @@ async def process_album(
         if text:
 
             album_caption = (
-                await rewrite_text(
+                await process_caption(
                     text
                 )
             )
@@ -593,109 +831,276 @@ async def process_album(
             break
 
     # --------------------------------------------------------
-    # Clean EVERY item first.
-    #
-    # If any item fails verification, don't publish a partial
-    # album.
+    # Download all original media FIRST.
     # --------------------------------------------------------
 
-    processed = []
+    items = []
 
     for msg in messages:
 
-        media = get_image_media(
+        media = get_media(
             msg
         )
 
         if not media:
+
             continue
 
-        cleaned = (
-            await clean_message_media(
+        media_bytes = (
+            await download_original_media(
                 msg
             )
         )
 
-        if not cleaned:
+        if not media_bytes:
 
             logger.error(
-                "❌ [%s] Album item failed verification.",
+                "❌ [%s] Album item could not be downloaded.",
                 msg.id,
             )
 
             return False
 
-        processed.append(
-            (
-                msg,
-                cleaned,
+        media_type = (
+            get_media_type(
+                msg
             )
         )
 
-    if not processed:
+        # Photo album can contain actual photos.
+        # GIF/video items are handled individually below.
+        items.append(
+            (
+                msg,
+                media_bytes,
+                media_type,
+            )
+        )
+
+    if not items:
 
         logger.error(
-            "❌ Album contains no processable media."
+            "❌ Album contains no supported media."
         )
 
         return False
 
     # --------------------------------------------------------
-    # Everything is now a still image.
+    # Separate photos from GIF/video.
     # --------------------------------------------------------
 
-    caption_used = False
+    photos = []
 
-    media_group = []
+    non_photos = []
 
-    for msg, cleaned in processed:
+    for item in items:
 
-        caption = None
+        if item[2] == "photo":
 
-        if (
-            not caption_used
-            and album_caption
+            photos.append(
+                item
+            )
+
+        else:
+
+            non_photos.append(
+                item
+            )
+
+    # --------------------------------------------------------
+    # Send photo album.
+    # --------------------------------------------------------
+
+    if photos:
+
+        photo_media = []
+
+        for index, (
+            msg,
+            media_bytes,
+            _,
+        ) in enumerate(
+            photos
         ):
 
-            caption = (
-                album_caption[:1024]
+            filename = (
+                "original.jpg"
             )
 
-            caption_used = True
+            photo_file = (
+                BufferedInputFile(
+                    media_bytes,
+                    filename=filename,
+                )
+            )
 
-        media_group.append(
-            InputMediaPhoto(
-                media=cleaned,
+            caption = None
+
+            if (
+                not photo_media
+                and album_caption
+            ):
+
+                caption = (
+                    album_caption[:1024]
+                )
+
+            photo_media.append(
+                InputMediaPhoto(
+                    media=photo_file,
+                    caption=caption,
+                )
+            )
+
+        # Telegram allows max 10 items per media group.
+        for start in range(
+            0,
+            len(photo_media),
+            10,
+        ):
+
+            chunk = photo_media[
+                start:start + 10
+            ]
+
+            logger.info(
+                "📤 Sending ORIGINAL photo album "
+                "with %d item(s).",
+                len(chunk),
+            )
+
+            await bot.send_media_group(
+                chat_id=target_id,
+                media=chunk,
+            )
+
+    # --------------------------------------------------------
+    # GIF/video cannot be safely mixed with normal photo
+    # InputMediaPhoto items, so send those individually.
+    # --------------------------------------------------------
+
+    caption_used = bool(
+        photos
+        and album_caption
+    )
+
+    for (
+        msg,
+        media_bytes,
+        media_type,
+    ) in non_photos:
+
+        filename = get_filename(
+            msg
+        )
+
+        if media_type == "animation":
+
+            if not filename.lower().endswith(
+                ".gif"
+            ):
+
+                filename = (
+                    "original.gif"
+                )
+
+            file = BufferedInputFile(
+                media_bytes,
+                filename=filename,
+            )
+
+            caption = None
+
+            if (
+                not caption_used
+                and album_caption
+            ):
+
+                caption = (
+                    album_caption[:1024]
+                )
+
+                caption_used = True
+
+            await bot.send_animation(
+                chat_id=target_id,
+                animation=file,
                 caption=caption,
             )
-        )
 
-    # --------------------------------------------------------
-    # Telegram max 10 media items per group.
-    # --------------------------------------------------------
+        elif media_type == "video":
 
-    for start in range(
-        0,
-        len(media_group),
-        10,
-    ):
+            if not any(
+                filename.lower().endswith(
+                    extension
+                )
+                for extension in (
+                    ".mp4",
+                    ".mov",
+                    ".m4v",
+                    ".webm",
+                )
+            ):
 
-        chunk = media_group[
-            start:start + 10
-        ]
+                filename = (
+                    "original.mp4"
+                )
 
-        logger.info(
-            "📤 Sending cleaned album chunk: %d item(s)",
-            len(chunk),
-        )
+            file = BufferedInputFile(
+                media_bytes,
+                filename=filename,
+            )
 
-        await bot.send_media_group(
-            chat_id=target_id,
-            media=chunk,
-        )
+            caption = None
+
+            if (
+                not caption_used
+                and album_caption
+            ):
+
+                caption = (
+                    album_caption[:1024]
+                )
+
+                caption_used = True
+
+            await bot.send_video(
+                chat_id=target_id,
+                video=file,
+                caption=caption,
+            )
+
+        else:
+
+            file = BufferedInputFile(
+                media_bytes,
+                filename=(
+                    filename
+                    or "original.media"
+                ),
+            )
+
+            caption = None
+
+            if (
+                not caption_used
+                and album_caption
+            ):
+
+                caption = (
+                    album_caption[:1024]
+                )
+
+                caption_used = True
+
+            await bot.send_document(
+                chat_id=target_id,
+                document=file,
+                caption=caption,
+            )
 
     logger.info(
-        "✅ Album posted successfully."
+        "✅ ORIGINAL album reposted."
     )
 
     return True
@@ -711,6 +1116,7 @@ async def process_channel(
 ):
 
     if not await ensure_connection():
+
         return
 
     try:
@@ -741,10 +1147,11 @@ async def process_channel(
             )
 
         if not messages:
+
             return
 
         # ----------------------------------------------------
-        # Group Telegram albums.
+        # Group albums.
         # ----------------------------------------------------
 
         groups = {}
@@ -785,7 +1192,7 @@ async def process_channel(
         )
 
         # ----------------------------------------------------
-        # Process groups sequentially.
+        # Process groups.
         # ----------------------------------------------------
 
         for group in ordered_groups:
@@ -809,22 +1216,13 @@ async def process_channel(
                     for item in group
                 ]
 
-                logger.info(
-                    "📚 Album %s detected with %d item(s).",
-                    grouped_id,
-                    len(group),
-                )
-
                 async with processing_lock:
 
                     if any(
-                        item_id in processing_ids
+                        item_id
+                        in processing_ids
                         for item_id in ids
                     ):
-
-                        logger.warning(
-                            "⚠️ Album already processing."
-                        )
 
                         continue
 
@@ -853,17 +1251,10 @@ async def process_channel(
                             max(ids),
                         )
 
-                    else:
-
-                        logger.error(
-                            "❌ Album failed. "
-                            "It will be retried."
-                        )
-
                 except Exception:
 
                     logger.exception(
-                        "❌ Album processing crashed."
+                        "❌ Album processing failed."
                     )
 
                 finally:
@@ -895,15 +1286,6 @@ async def process_channel(
                 )
 
             try:
-
-                logger.info(
-                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                )
-
-                logger.info(
-                    "📩 Processing message %s",
-                    msg.id,
-                )
 
                 success = (
                     await process_single_message(
@@ -948,7 +1330,7 @@ async def process_channel(
                     )
 
             await asyncio.sleep(
-                2
+                1
             )
 
     except errors.rpcerrorlist.AuthKeyError:
@@ -1012,35 +1394,39 @@ async def poll_channels():
 async def main():
 
     logger.info(
-        "🚀 Starting Telegram OpenAI Watermark Editor..."
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
 
     logger.info(
-        "   Caption: exact existing replacement"
+        "🚀 Starting Telegram Repost Bot"
     )
 
     logger.info(
-        "   Image/GIF: representative still → GPT-Image-2 edit"
+        "   🖼️ Original media: ENABLED"
     )
 
     logger.info(
-        "   Verification: enabled by default"
+        "   🤖 OpenAI generation: DISABLED"
     )
 
     logger.info(
-        "   Retries: enabled"
+        "   🧹 Watermark removal: DISABLED"
     )
 
     logger.info(
-        "   Replicate: disabled"
+        "   🔁 Caption replacement: ENABLED"
     )
 
     logger.info(
-        "   Albums: enabled"
+        "   📚 Telegram albums: ENABLED"
+    )
+
+    logger.info(
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
 
     # --------------------------------------------------------
-    # Telegram login.
+    # Telegram user client.
     # --------------------------------------------------------
 
     await user_client.start(
@@ -1061,7 +1447,7 @@ async def main():
     )
 
     # --------------------------------------------------------
-    # Register channel.
+    # Register default channel.
     # --------------------------------------------------------
 
     existing = (
@@ -1092,7 +1478,7 @@ async def main():
         )
 
     # --------------------------------------------------------
-    # Don't process historical messages at startup.
+    # Start from newest message.
     # --------------------------------------------------------
 
     for client in (
@@ -1131,8 +1517,14 @@ async def main():
         except Exception:
 
             logger.exception(
-                "❌ Could not read latest source message."
+                "❌ Could not get newest message "
+                "from %s.",
+                source,
             )
+
+    # --------------------------------------------------------
+    # Start polling.
+    # --------------------------------------------------------
 
     logger.info(
         "🚀 Starting polling loop..."
