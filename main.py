@@ -7,6 +7,7 @@ from collections import defaultdict
 from dotenv import load_dotenv
 
 from telethon import TelegramClient
+from telethon.sessions import StringSession
 from telethon.tl.types import (
     MessageMediaPhoto,
     DocumentAttributeFilename,
@@ -32,9 +33,17 @@ from ai_processor import (
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-API_ID = int(os.getenv("API_ID", "0"))
+
+API_ID_RAW = os.getenv("API_ID", "").strip()
 API_HASH = os.getenv("API_HASH", "").strip()
 PHONE_NUMBER = os.getenv("PHONE_NUMBER", "").strip()
+
+# IMPORTANT:
+# This is the Telethon StringSession generated once locally.
+TELEGRAM_SESSION = os.getenv(
+    "TELEGRAM_SESSION",
+    "",
+).strip()
 
 SOURCE_CHANNEL = int(
     os.getenv(
@@ -58,6 +67,15 @@ POLL_INTERVAL = int(
 )
 
 # ============================================================
+# VALIDATE API ID
+# ============================================================
+
+try:
+    API_ID = int(API_ID_RAW)
+except ValueError:
+    API_ID = 0
+
+# ============================================================
 # LOGGING
 # ============================================================
 
@@ -74,21 +92,39 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============================================================
-# TELEGRAM CLIENTS
+# TELEGRAM USER CLIENT
 # ============================================================
 
-user_client = TelegramClient(
-    "telegram_user_session",
-    API_ID,
-    API_HASH,
-)
+if TELEGRAM_SESSION:
+    logger.info(
+        "🔐 Using Telegram StringSession."
+    )
 
-# aiogram 3.7+
-# Do NOT pass parse_mode directly to Bot().
+    user_client = TelegramClient(
+        StringSession(TELEGRAM_SESSION),
+        API_ID,
+        API_HASH,
+    )
+
+else:
+    logger.error(
+        "❌ TELEGRAM_SESSION is missing."
+    )
+
+    user_client = TelegramClient(
+        StringSession(),
+        API_ID,
+        API_HASH,
+    )
+
+# ============================================================
+# AIROGRAM BOT
+# ============================================================
+
 bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(
-        parse_mode=None
+        parse_mode=None,
     ),
 )
 
@@ -110,12 +146,50 @@ SUPPORTED_EXTENSIONS = {
 
 
 # ============================================================
+# ENV VALIDATION
+# ============================================================
+
+def validate_environment():
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "BOT_TOKEN is missing."
+        )
+
+    if not API_ID:
+        raise RuntimeError(
+            "API_ID is missing or invalid."
+        )
+
+    if not API_HASH:
+        raise RuntimeError(
+            "API_HASH is missing."
+        )
+
+    if not TELEGRAM_SESSION:
+        raise RuntimeError(
+            "TELEGRAM_SESSION is missing. "
+            "Generate a Telethon StringSession locally "
+            "and add it to Render Environment Variables."
+        )
+
+    if not SOURCE_CHANNEL:
+        raise RuntimeError(
+            "SOURCE_CHANNEL is missing."
+        )
+
+    if not TARGET_CHANNEL:
+        raise RuntimeError(
+            "TARGET_CHANNEL is missing."
+        )
+
+
+# ============================================================
 # FILE / MEDIA HELPERS
 # ============================================================
 
 def get_filename(message):
     """
-    Try to recover the original Telegram filename.
+    Get the original Telegram filename where available.
     """
 
     if not message or not message.media:
@@ -128,6 +202,7 @@ def get_filename(message):
     )
 
     if document:
+
         attributes = getattr(
             document,
             "attributes",
@@ -135,7 +210,9 @@ def get_filename(message):
         )
 
         if attributes:
+
             for attr in attributes:
+
                 if isinstance(
                     attr,
                     DocumentAttributeFilename,
@@ -147,12 +224,12 @@ def get_filename(message):
 
 def get_media_type(message):
     """
-    Determine how the media should be reposted.
+    Determine how Telegram media should be reposted.
     """
 
     media = message.media
 
-    # Telegram photo
+    # Native Telegram photo
     if isinstance(
         media,
         MessageMediaPhoto,
@@ -166,6 +243,7 @@ def get_media_type(message):
     )
 
     if document:
+
         mime = (
             getattr(
                 document,
@@ -183,16 +261,17 @@ def get_media_type(message):
         if mime.startswith("video/"):
             return "video"
 
-        # Image/document
+        # Image
         if mime.startswith("image/"):
             return "image"
 
-        # Fallback to filename
+        # Filename fallback
         filename = get_filename(
             message
         ).lower()
 
         for ext in SUPPORTED_EXTENSIONS:
+
             if filename.endswith(ext):
 
                 if ext == ".gif":
@@ -219,7 +298,7 @@ def get_media_type(message):
 
 async def download_media(message):
     """
-    Download Telegram media directly into memory.
+    Download Telegram media into memory.
     """
 
     buffer = io.BytesIO()
@@ -241,11 +320,10 @@ async def process_image(
     filename,
 ):
     """
-    Send still images through the AI watermark remover.
+    Send still images to the AI watermark-removal processor.
 
-    GIFs/videos are intentionally skipped so the original
-    animation/video is preserved and no frame-by-frame
-    OpenAI charges occur.
+    GIFs and videos are left untouched to avoid expensive
+    frame-by-frame processing.
     """
 
     if not media_bytes:
@@ -255,7 +333,7 @@ async def process_image(
         filename or ""
     ).lower()
 
-    # Do not send animated/video files to the image editor.
+    # Preserve animation/video exactly.
     if lower_name.endswith(
         (
             ".gif",
@@ -265,11 +343,13 @@ async def process_image(
             ".webm",
         )
     ):
+
         logger.info(
             "⏭️ %s is animation/video. "
             "Keeping original.",
             filename,
         )
+
         return None
 
     logger.info(
@@ -278,30 +358,36 @@ async def process_image(
     )
 
     try:
-        cleaned = await remove_watermarks_from_bytes(
-            media_bytes,
-            filename,
+
+        cleaned = (
+            await remove_watermarks_from_bytes(
+                media_bytes,
+                filename,
+            )
         )
 
         if cleaned:
+
             logger.info(
-                "✅ Watermark-removed image received."
+                "✅ Cleaned image received."
             )
+
             return cleaned
 
         logger.info(
-            "📌 No edited image returned. "
-            "Using original."
+            "📌 Original image retained."
         )
 
         return None
 
     except Exception:
+
         logger.exception(
-            "❌ Watermark processing failed for %s. "
-            "Using original.",
+            "❌ Watermark processing failed "
+            "for %s. Using original.",
             filename,
         )
+
         return None
 
 
@@ -311,10 +397,10 @@ async def process_image(
 
 async def prepare_caption(message):
     """
-    Preserve caption exactly except for the rules handled
-    by rewrite_text():
-      - remove *
-      - replace @cappersfree
+    Caption handling remains:
+      1. Remove *
+      2. Replace @cappersfree
+      3. Change nothing else
     """
 
     caption = (
@@ -336,13 +422,11 @@ async def prepare_caption(message):
 # ============================================================
 
 async def send_single(message):
-    """
-    Download, optionally clean the image, and repost.
-    """
 
     try:
+
         # ----------------------------------------------------
-        # TEXT ONLY
+        # TEXT-ONLY MESSAGE
         # ----------------------------------------------------
 
         if not message.media:
@@ -352,6 +436,7 @@ async def send_single(message):
             )
 
             if caption:
+
                 await bot.send_message(
                     TARGET_CHANNEL,
                     caption,
@@ -365,7 +450,7 @@ async def send_single(message):
             return True
 
         # ----------------------------------------------------
-        # GET MEDIA INFO
+        # MEDIA INFO
         # ----------------------------------------------------
 
         filename = get_filename(
@@ -388,11 +473,13 @@ async def send_single(message):
         )
 
         if not original_bytes:
+
             logger.error(
                 "❌ Failed to download media "
                 "for message %s.",
                 message.id,
             )
+
             return False
 
         # ----------------------------------------------------
@@ -404,7 +491,7 @@ async def send_single(message):
         )
 
         # ----------------------------------------------------
-        # AI WATERMARK REMOVAL
+        # WATERMARK REMOVAL
         # ----------------------------------------------------
 
         cleaned_bytes = None
@@ -413,6 +500,7 @@ async def send_single(message):
             "photo",
             "image",
         }:
+
             cleaned_bytes = await process_image(
                 original_bytes,
                 filename,
@@ -425,7 +513,7 @@ async def send_single(message):
         )
 
         # ----------------------------------------------------
-        # PREPARE TELEGRAM FILE
+        # TELEGRAM FILE
         # ----------------------------------------------------
 
         file = BufferedInputFile(
@@ -434,7 +522,7 @@ async def send_single(message):
         )
 
         # ----------------------------------------------------
-        # PHOTO / IMAGE
+        # PHOTO
         # ----------------------------------------------------
 
         if media_type in {
@@ -473,7 +561,7 @@ async def send_single(message):
             )
 
         # ----------------------------------------------------
-        # OTHER DOCUMENT
+        # DOCUMENT
         # ----------------------------------------------------
 
         else:
@@ -492,6 +580,7 @@ async def send_single(message):
         return True
 
     except Exception:
+
         logger.exception(
             "❌ Failed processing message %s.",
             message.id,
@@ -505,12 +594,6 @@ async def send_single(message):
 # ============================================================
 
 async def process_album(messages):
-    """
-    Process a Telegram album.
-
-    Still images are grouped together where Telegram permits it.
-    Videos/GIFs/documents are sent separately.
-    """
 
     if not messages:
         return False
@@ -532,20 +615,23 @@ async def process_album(messages):
     caption = None
 
     for msg in messages:
+
         if msg.message:
+
             caption = await rewrite_text(
                 msg.message
             )
+
             break
 
     # --------------------------------------------------------
-    # COLLECT PHOTOS
+    # PHOTO ITEMS
     # --------------------------------------------------------
 
     photo_items = []
 
     # --------------------------------------------------------
-    # PROCESS EACH ITEM
+    # PROCESS ALBUM ITEMS
     # --------------------------------------------------------
 
     for msg in messages:
@@ -573,11 +659,12 @@ async def process_album(messages):
         )
 
         if not original_bytes:
+
             logger.error(
-                "❌ Could not download "
-                "album item %s.",
+                "❌ Could not download album item %s.",
                 msg.id,
             )
+
             continue
 
         # ----------------------------------------------------
@@ -608,7 +695,7 @@ async def process_album(messages):
             )
 
         # ----------------------------------------------------
-        # GIF / VIDEO / DOCUMENT
+        # VIDEO / GIF / DOCUMENT
         # ----------------------------------------------------
 
         else:
@@ -642,12 +729,11 @@ async def process_album(messages):
                     caption=caption,
                 )
 
-            # Caption should only appear once.
             caption = None
 
     # --------------------------------------------------------
-    # SEND PHOTO ALBUM
-    # Telegram allows max 10 items per media group.
+    # SEND PHOTO GROUPS
+    # Telegram maximum is 10 photos per media group.
     # --------------------------------------------------------
 
     if photo_items:
@@ -700,39 +786,38 @@ async def process_album(messages):
 
 
 # ============================================================
-# DATABASE START POSITION
+# DATABASE
 # ============================================================
 
 def get_start_message_id():
-    """
-    Read the last processed message ID from the database.
-    """
 
     try:
+
         return database.get_last_processed(
             SOURCE_CHANNEL
         )
 
     except Exception:
+
         logger.exception(
             "⚠️ Could not read last processed "
             "message from database."
         )
+
         return None
 
 
 def save_last_message_id(message_id):
-    """
-    Save the last processed message ID.
-    """
 
     try:
+
         database.set_last_processed(
             SOURCE_CHANNEL,
             message_id,
         )
 
     except Exception:
+
         logger.exception(
             "⚠️ Could not save last processed "
             "message ID %s.",
@@ -741,13 +826,10 @@ def save_last_message_id(message_id):
 
 
 # ============================================================
-# CHANNEL POLLING
+# SOURCE CHANNEL POLLING
 # ============================================================
 
 async def process_channel():
-    """
-    Poll the source channel for new messages.
-    """
 
     logger.info(
         "📡 Starting source-channel polling..."
@@ -758,7 +840,7 @@ async def process_channel():
     )
 
     # --------------------------------------------------------
-    # FIRST RUN
+    # INITIAL START POSITION
     # --------------------------------------------------------
 
     if last_message_id is None:
@@ -777,9 +859,7 @@ async def process_channel():
             )
 
             logger.info(
-                "📌 Initial position set to "
-                "message %s. Existing messages "
-                "will not be replayed.",
+                "📌 Initial position set to message %s.",
                 last_message_id,
             )
 
@@ -791,7 +871,7 @@ async def process_channel():
         )
 
     # --------------------------------------------------------
-    # MAIN LOOP
+    # POLLING LOOP
     # --------------------------------------------------------
 
     while True:
@@ -812,13 +892,13 @@ async def process_channel():
 
             if newest_messages:
 
-                # ------------------------------------------------
-                # GROUP ALBUMS
-                # ------------------------------------------------
-
                 album_groups = defaultdict(list)
 
                 normal_messages = []
+
+                # ------------------------------------------------
+                # GROUP ALBUMS
+                # ------------------------------------------------
 
                 for msg in newest_messages:
 
@@ -897,9 +977,11 @@ async def process_channel():
             )
 
         except asyncio.CancelledError:
+
             raise
 
         except Exception:
+
             logger.exception(
                 "❌ Polling loop error."
             )
@@ -907,42 +989,6 @@ async def process_channel():
             await asyncio.sleep(
                 POLL_INTERVAL
             )
-
-
-# ============================================================
-# VALIDATION
-# ============================================================
-
-def validate_environment():
-    if not BOT_TOKEN:
-        raise RuntimeError(
-            "BOT_TOKEN is missing."
-        )
-
-    if not API_ID:
-        raise RuntimeError(
-            "API_ID is missing."
-        )
-
-    if not API_HASH:
-        raise RuntimeError(
-            "API_HASH is missing."
-        )
-
-    if not PHONE_NUMBER:
-        raise RuntimeError(
-            "PHONE_NUMBER is missing."
-        )
-
-    if not SOURCE_CHANNEL:
-        raise RuntimeError(
-            "SOURCE_CHANNEL is missing."
-        )
-
-    if not TARGET_CHANNEL:
-        raise RuntimeError(
-            "TARGET_CHANNEL is missing."
-        )
 
 
 # ============================================================
@@ -968,15 +1014,19 @@ async def main():
     )
 
     logger.info(
+        "🔐 Telegram authentication: StringSession"
+    )
+
+    logger.info(
         "🧹 Watermark removal: ENABLED"
     )
 
     logger.info(
-        "🤖 AI editing is used only for still images."
+        "🤖 AI editing: still images only"
     )
 
     logger.info(
-        "🎞️ GIFs/videos are preserved unchanged."
+        "🎞️ GIFs/videos: original media preserved"
     )
 
     logger.info(
@@ -1017,23 +1067,82 @@ async def main():
 
         logger.warning(
             "⚠️ OPENAI_API_KEY is missing. "
-            "Images will be reposted without AI editing."
+            "Images will be posted without AI editing."
         )
 
     # --------------------------------------------------------
-    # START TELETHON
+    # CONNECT TELEGRAM
     # --------------------------------------------------------
 
-    await user_client.start(
-        phone=PHONE_NUMBER
+    logger.info(
+        "🔌 Connecting to Telegram..."
     )
+
+    await user_client.connect()
+
+    # --------------------------------------------------------
+    # CHECK AUTHENTICATION
+    # --------------------------------------------------------
+
+    try:
+
+        authorized = await user_client.is_user_authorized()
+
+    except Exception:
+
+        logger.exception(
+            "❌ Could not verify Telegram authorization."
+        )
+
+        await user_client.disconnect()
+
+        raise
+
+    if not authorized:
+
+        await user_client.disconnect()
+
+        raise RuntimeError(
+            "Telegram StringSession is not authorized. "
+            "Generate a new StringSession locally and "
+            "add it to TELEGRAM_SESSION on Render."
+        )
+
+    # --------------------------------------------------------
+    # GET ACCOUNT
+    # --------------------------------------------------------
+
+    try:
+
+        me = await user_client.get_me()
+
+        if me:
+
+            username = (
+                f"@{me.username}"
+                if me.username
+                else "(no username)"
+            )
+
+            logger.info(
+                "✅ Telegram account authenticated: %s | %s",
+                me.first_name or "",
+                username,
+            )
+
+    except Exception:
+
+        logger.warning(
+            "⚠️ Telegram connected, but account "
+            "information could not be read."
+        )
 
     logger.info(
         "✅ Telegram user client connected!"
     )
 
     # --------------------------------------------------------
-    # START POLLING
+    # START PROCESSING
     # --------------------------------------------------------
 
     try:
@@ -1041,6 +1150,10 @@ async def main():
         await process_channel()
 
     finally:
+
+        logger.info(
+            "🛑 Shutting down..."
+        )
 
         try:
             await user_client.disconnect()
@@ -1058,18 +1171,23 @@ async def main():
 # ============================================================
 
 if __name__ == "__main__":
+
     try:
+
         asyncio.run(
             main()
         )
 
     except KeyboardInterrupt:
+
         logger.info(
             "🛑 Bot stopped."
         )
 
     except Exception:
+
         logger.exception(
             "💥 Fatal startup error."
         )
+
         raise
