@@ -21,10 +21,7 @@ def init_db():
     conn = get_connection()
     c = conn.cursor()
 
-    # --------------------------------------------------------
-    # CLIENT CONFIGURATION
-    # --------------------------------------------------------
-
+    # Client/source/target configuration
     c.execute("""
         CREATE TABLE IF NOT EXISTS clients (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -35,11 +32,7 @@ def init_db():
         )
     """)
 
-    # --------------------------------------------------------
-    # MESSAGE PROCESSING POSITION
-    # One last processed message ID per source channel.
-    # --------------------------------------------------------
-
+    # Last processed Telegram message per source channel
     c.execute("""
         CREATE TABLE IF NOT EXISTS processing_state (
             source_channel_id INTEGER PRIMARY KEY,
@@ -59,9 +52,7 @@ def add_client(
     source_channel_id: int,
     target_channel_id: int,
 ) -> bool:
-
     try:
-
         conn = get_connection()
         c = conn.cursor()
 
@@ -84,17 +75,14 @@ def add_client(
 
         conn.commit()
         conn.close()
-
         return True
 
     except Exception as e:
-
         print(f"DB Error adding client: {e}")
         return False
 
 
 def get_all_clients() -> List[Dict]:
-
     conn = get_connection()
     c = conn.cursor()
 
@@ -110,18 +98,13 @@ def get_all_clients() -> List[Dict]:
     )
 
     rows = c.fetchall()
-
     conn.close()
 
     result = []
 
     for row in rows:
-
         try:
-            settings = json.loads(
-                row[2] or "{}"
-            )
-
+            settings = json.loads(row[2] or "{}")
         except Exception:
             settings = {}
 
@@ -139,7 +122,6 @@ def get_all_clients() -> List[Dict]:
 def get_target_for_source(
     source_channel_id: int,
 ) -> Optional[int]:
-
     conn = get_connection()
     c = conn.cursor()
 
@@ -154,7 +136,6 @@ def get_target_for_source(
     )
 
     row = c.fetchone()
-
     conn.close()
 
     return row[0] if row else None
@@ -167,7 +148,6 @@ def get_target_for_source(
 def get_last_processed(
     source_channel_id: int,
 ) -> Optional[int]:
-
     conn = get_connection()
     c = conn.cursor()
 
@@ -181,7 +161,6 @@ def get_last_processed(
     )
 
     row = c.fetchone()
-
     conn.close()
 
     if row is None:
@@ -194,9 +173,7 @@ def set_last_processed(
     source_channel_id: int,
     message_id: int,
 ) -> bool:
-
     try:
-
         conn = get_connection()
         c = conn.cursor()
 
@@ -208,7 +185,6 @@ def set_last_processed(
                 last_processed_message_id
             )
             VALUES (?, ?)
-
             ON CONFLICT(source_channel_id)
             DO UPDATE SET
                 last_processed_message_id =
@@ -222,28 +198,21 @@ def set_last_processed(
 
         conn.commit()
         conn.close()
-
         return True
 
     except Exception as e:
-
-        print(
-            f"DB Error saving processing state: {e}"
-        )
-
+        print(f"DB Error saving processing state: {e}")
         return False
 
 
 # ============================================================
-# OPTIONAL RESET FUNCTION
+# OPTIONAL RESET
 # ============================================================
 
 def reset_last_processed(
     source_channel_id: int,
 ) -> bool:
-
     try:
-
         conn = get_connection()
         c = conn.cursor()
 
@@ -257,15 +226,10 @@ def reset_last_processed(
 
         conn.commit()
         conn.close()
-
         return True
 
     except Exception as e:
-
-        print(
-            f"DB Error resetting processing state: {e}"
-        )
-
+        print(f"DB Error resetting processing state: {e}")
         return False
 
 
