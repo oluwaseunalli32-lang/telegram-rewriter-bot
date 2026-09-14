@@ -43,10 +43,18 @@ OLD_MENTION = "@cappersfree"
 _openai_images_used = 0
 
 client = (
-    AsyncOpenAI(api_key=OPENAI_API_KEY)
+    AsyncOpenAI(
+        api_key=OPENAI_API_KEY,
+        max_retries=0,
+    )
     if OPENAI_API_KEY and AsyncOpenAI
     else None
 )
+
+# Once an API billing/quota error occurs, disable OpenAI for the rest of
+# this process run. This prevents a dead key/balance from being hammered.
+_openai_blocked = False
+_openai_block_reason = ""
 
 
 # ============================================================
@@ -262,10 +270,17 @@ async def _openai_edit_one(
     prompt: str,
     filename: str,
 ) -> Optional[bytes]:
-    global _openai_images_used
+    global _openai_images_used, _openai_blocked, _openai_block_reason
 
     if client is None:
         logger.warning("⚠️ OPENAI_API_KEY missing. Skipping AI edit.")
+        return None
+
+    if _openai_blocked:
+        logger.warning(
+            "🛑 OpenAI is disabled for this run: %s. Keeping original.",
+            _openai_block_reason or "previous API failure",
+        )
         return None
 
     if _openai_images_used >= MAX_OPENAI_IMAGES_PER_RUN:
@@ -295,6 +310,10 @@ async def _openai_edit_one(
         requested_size,
     )
 
+    # Count the attempt BEFORE the network call.
+    # This guarantees the per-run limit cannot be bypassed by failed requests.
+    _openai_images_used += 1
+
     try:
         response = await client.images.edit(
             model=OPENAI_IMAGE_MODEL,
@@ -305,12 +324,21 @@ async def _openai_edit_one(
             output_format="png",
             n=1,
         )
-    except Exception:
-        logger.exception("❌ OpenAI image edit failed: %s", filename)
-        return None
+    except Exception as exc:
+        status = getattr(exc, "status_code", None)
+        error_text = str(exc)
 
-    # This limit is on actual returned images, so a successful response is counted here.
-    _openai_images_used += 1
+        if status == 429 or "insufficient_quota" in error_text or "credit_balance_exhausted" in error_text:
+            _openai_blocked = True
+            _openai_block_reason = "quota/credit exhausted or rate limited"
+            logger.error(
+                "🛑 OpenAI disabled for the rest of this run after quota/rate-limit failure: %s",
+                filename,
+            )
+        else:
+            logger.exception("❌ OpenAI image edit failed: %s", filename)
+
+        return None
 
     if not response.data:
         logger.error("❌ OpenAI returned no image data: %s", filename)
