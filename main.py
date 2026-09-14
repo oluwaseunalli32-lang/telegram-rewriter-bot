@@ -81,6 +81,11 @@ SUPPORTED_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".webp", ".gif", ".mp4", ".mov", ".m4v", ".webm",
 }
 
+# Messages that failed in this process run are not retried every polling cycle.
+# They can be retried after a service restart.
+_blocked_message_ids = set()
+_blocked_album_ids = set()
+
 
 # ============================================================
 # VALIDATION
@@ -232,6 +237,9 @@ async def send_clean_image_outputs(
 # ============================================================
 
 async def send_single(message):
+    if message.id in _blocked_message_ids:
+        return False
+
     try:
         if not message.media:
             caption = await prepare_caption(message)
@@ -325,6 +333,7 @@ async def send_single(message):
         return True
 
     except Exception:
+        _blocked_message_ids.add(message.id)
         logger.exception("❌ Failed processing message %s", message.id)
         return False
 
@@ -338,6 +347,10 @@ async def process_album(messages):
         return False
 
     messages = sorted(messages, key=lambda m: m.id)
+    album_key = tuple(m.id for m in messages)
+
+    if album_key in _blocked_album_ids:
+        return False
 
     caption = None
     for msg in messages:
@@ -522,9 +535,11 @@ async def process_channel():
                         last_id = max(last_id or 0, msg.id)
                         set_last_processed(last_id)
                     else:
-                        # Do not mark failed messages as processed.
+                        # Do not mark failed messages as processed, but block them
+                        # for this process run so they are not retried every 3 seconds.
+                        _blocked_message_ids.add(msg.id)
                         logger.warning(
-                            "⏸️ Message %s was NOT marked processed because posting failed.",
+                            "⏸️ Message %s blocked until restart because posting failed.",
                             msg.id,
                         )
 
@@ -539,12 +554,22 @@ async def process_channel():
                         len(group),
                     )
 
-                    if await process_album(group):
+                    try:
+                        album_ok = await process_album(group)
+                    except Exception:
+                        _blocked_album_ids.add(tuple(sorted(m.id for m in group)))
+                        logger.exception(
+                            "❌ Album processing failed; it will not be retried until restart."
+                        )
+                        album_ok = False
+
+                    if album_ok:
                         last_id = max(last_id or 0, max(m.id for m in group))
                         set_last_processed(last_id)
                     else:
+                        _blocked_album_ids.add(tuple(sorted(m.id for m in group)))
                         logger.warning(
-                            "⏸️ Album was not marked processed because posting failed."
+                            "⏸️ Album was not marked processed and is blocked until restart."
                         )
 
             await asyncio.sleep(POLL_INTERVAL)
