@@ -161,19 +161,31 @@ def likely_has_cappersfree_watermark(image: Image.Image) -> bool:
 # IMAGE SIZING / PADDING
 # ============================================================
 
-def _fit_for_image_api(source: Image.Image) -> Tuple[Image.Image, Tuple[int, int], Tuple[int, int, int, int]]:
-    """Prepare an image for GPT image editing while preserving the full original frame.
+def _fit_for_image_api(
+    source: Image.Image,
+) -> Tuple[Image.Image, Tuple[int, int], Tuple[int, int, int, int]]:
+    """Prepare an image for GPT image editing using safe canvas sizes.
 
-    GPT image endpoints require a bounded aspect ratio. If an incoming image is
-    outside 3:1, edge-padding is used instead of cropping. The padded result is
-    cropped back to the original content after editing.
+    The previous beta sent arbitrary dimensions such as 848x528. GPT-Image-2
+    can reject small/custom canvases with a minimum-pixel-budget error.
+
+    We therefore place the complete source image on one of the conservative
+    image-edit canvas sizes below, preserving the source aspect ratio with
+    letterbox padding and cropping the result back afterward.
+
+    Supported canvas choices used here:
+      - landscape: 1536x1024
+      - portrait:  1024x1536
+      - square:    1024x1024
     """
     src = source.convert("RGB")
     original_size = src.size
 
-    max_side = 1536
-    if max(src.size) > max_side:
-        scale = max_side / float(max(src.size))
+    # Work with a reasonable source maximum before placing it on the API
+    # canvas. This keeps memory/input size under control without cropping.
+    max_source_side = 1536
+    if max(src.size) > max_source_side:
+        scale = max_source_side / float(max(src.size))
         src = src.resize(
             (
                 max(16, int(round(src.width * scale))),
@@ -185,40 +197,54 @@ def _fit_for_image_api(source: Image.Image) -> Tuple[Image.Image, Tuple[int, int
     w, h = src.size
     ratio = w / float(h)
 
-    # Pad only when outside the allowed 1:3..3:1 range.
-    if ratio > 3.0:
-        new_h = int(np.ceil(w / 3.0 / 16.0) * 16)
-        pad_total = max(0, new_h - h)
-        top = pad_total // 2
-        bottom = pad_total - top
-        padded = Image.new("RGB", (w, new_h))
-        padded.paste(src, (0, top))
-        crop_box = (0, top, w, top + h)
-        src = padded
-    elif ratio < (1.0 / 3.0):
-        new_w = int(np.ceil(h / 3.0 / 16.0) * 16)
-        pad_total = max(0, new_w - w)
-        left = pad_total // 2
-        right = pad_total - left
-        padded = Image.new("RGB", (new_w, h))
-        padded.paste(src, (left, 0))
-        crop_box = (left, 0, left + w, h)
-        src = padded
+    if ratio > 1.15:
+        canvas = (1536, 1024)
+    elif ratio < 0.87:
+        canvas = (1024, 1536)
     else:
-        crop_box = (0, 0, src.width, src.height)
+        canvas = (1024, 1024)
 
-    # API wants dimensions divisible by 16. Pad minimally instead of cropping.
-    extra_w = (16 - (src.width % 16)) % 16
-    extra_h = (16 - (src.height % 16)) % 16
+    canvas_w, canvas_h = canvas
 
-    if extra_w or extra_h:
-        padded = Image.new("RGB", (src.width + extra_w, src.height + extra_h))
-        padded.paste(src, (0, 0))
-        src = padded
-        # Any bottom/right padding should not be part of the desired content.
-        crop_box = (crop_box[0], crop_box[1], crop_box[2], crop_box[3])
+    # Fit the complete source inside the canvas without distortion/cropping.
+    scale = min(
+        canvas_w / float(w),
+        canvas_h / float(h),
+    )
 
-    return src, original_size, crop_box
+    fitted_w = max(16, int(round(w * scale)))
+    fitted_h = max(16, int(round(h * scale)))
+
+    if (fitted_w, fitted_h) != (w, h):
+        fitted = src.resize(
+            (fitted_w, fitted_h),
+            Image.Resampling.LANCZOS,
+        )
+    else:
+        fitted = src
+
+    left = (canvas_w - fitted_w) // 2
+    top = (canvas_h - fitted_h) // 2
+
+    prepared = Image.new(
+        "RGB",
+        canvas,
+        (0, 0, 0),
+    )
+    prepared.paste(
+        fitted,
+        (left, top),
+    )
+
+    # crop_box is the location of the actual source content on the API canvas.
+    crop_box = (
+        left,
+        top,
+        left + fitted_w,
+        top + fitted_h,
+    )
+
+    return prepared, original_size, crop_box
 
 
 def _restore_original_dimensions(
