@@ -3,6 +3,7 @@ import io
 import re
 import base64
 import logging
+import tempfile
 from typing import Optional, List, Tuple
 
 import cv2
@@ -22,58 +23,33 @@ logger = logging.getLogger("ai_processor")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2").strip()
-# Low is the safest beta default for cost. gpt-image-2 supports low/medium/high.
 OPENAI_IMAGE_QUALITY = os.getenv("OPENAI_IMAGE_QUALITY", "low").strip().lower()
 
-# Hard safety limit. Counted per returned image, not just per HTTP request.
-BETA_MODE = os.getenv("BETA_MODE", "true").strip().lower() in {"1", "true", "yes", "on"}
-MAX_OPENAI_IMAGES_PER_RUN = int(os.getenv("MAX_OPENAI_IMAGES_PER_RUN", "1"))
-
-# Optional four-variation stage. Keep OFF during beta.
-GENERATE_VARIATIONS = os.getenv("GENERATE_VARIATIONS", "false").strip().lower() in {"1", "true", "yes", "on"}
+# Production mode: NO application-imposed image/hour/run limit.
+# OpenAI billing, account limits, and API rate limits still apply.
+GENERATE_VARIATIONS = os.getenv("GENERATE_VARIATIONS", "true").strip().lower() in {"1", "true", "yes", "on"}
 VARIATION_COUNT = max(1, min(4, int(os.getenv("VARIATION_COUNT", "4"))))
-MAX_VARIATION_IMAGES_PER_RUN = int(os.getenv("MAX_VARIATION_IMAGES_PER_RUN", "4"))
 
 NEW_MENTION = os.getenv("NEW_MENTION", "@PrimeAnalysiss").strip()
 if NEW_MENTION and not NEW_MENTION.startswith("@"):
     NEW_MENTION = "@" + NEW_MENTION
-
 OLD_MENTION = "@cappersfree"
 
-_openai_images_used = 0
-
 client = (
-    AsyncOpenAI(
-        api_key=OPENAI_API_KEY,
-        max_retries=0,
-    )
+    AsyncOpenAI(api_key=OPENAI_API_KEY, max_retries=0)
     if OPENAI_API_KEY and AsyncOpenAI
     else None
 )
-
-# Once an API billing/quota error occurs, disable OpenAI for the rest of
-# this process run. This prevents a dead key/balance from being hammered.
-_openai_blocked = False
-_openai_block_reason = ""
-
 
 # ============================================================
 # CAPTIONS
 # ============================================================
 
 def replace_username(text: Optional[str]) -> Optional[str]:
-    """Caption rule: remove * and replace only @cappersfree."""
     if not text:
         return text
-
     result = text.replace("*", "")
-    result = re.sub(
-        re.escape(OLD_MENTION),
-        NEW_MENTION,
-        result,
-        flags=re.IGNORECASE,
-    )
-    return result
+    return re.sub(re.escape(OLD_MENTION), NEW_MENTION, result, flags=re.IGNORECASE)
 
 
 async def rewrite_text(original_text: Optional[str]) -> Optional[str]:
@@ -81,122 +57,53 @@ async def rewrite_text(original_text: Optional[str]) -> Optional[str]:
 
 
 # ============================================================
-# LOCAL WATERMARK SIGNAL DETECTION
+# WATERMARK SIGNALS
 # ============================================================
 
-def _bgr_to_hsv(image: np.ndarray) -> np.ndarray:
-    return cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-
-
 def red_signal_ratio(image: np.ndarray) -> float:
-    """Detect strong or faint red/pink signal anywhere in an image.
-
-    This is intentionally only a trigger, not the edit mask. The OpenAI
-    image editor is asked to locate the branding across the entire image.
-    """
     if image is None or image.size == 0:
         return 0.0
-
-    hsv = _bgr_to_hsv(image)
-
-    strong1 = cv2.inRange(
-        hsv,
-        np.array([0, 120, 100], dtype=np.uint8),
-        np.array([12, 255, 255], dtype=np.uint8),
-    )
-    strong2 = cv2.inRange(
-        hsv,
-        np.array([170, 120, 100], dtype=np.uint8),
-        np.array([179, 255, 255], dtype=np.uint8),
-    )
-
-    # Faint pink/red overlay: modest red dominance with reasonably bright pixels.
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    strong1 = cv2.inRange(hsv, np.array([0, 120, 100], np.uint8), np.array([12, 255, 255], np.uint8))
+    strong2 = cv2.inRange(hsv, np.array([170, 120, 100], np.uint8), np.array([179, 255, 255], np.uint8))
     b, g, r = cv2.split(image)
-    ri = r.astype(np.int16)
-    gi = g.astype(np.int16)
-    bi = b.astype(np.int16)
-    faint = (
-        (ri - gi >= 15)
-        & (ri - bi >= 8)
-        & (ri >= 175)
-        & (gi <= 245)
-    ).astype(np.uint8) * 255
-
+    ri, gi, bi = r.astype(np.int16), g.astype(np.int16), b.astype(np.int16)
+    faint = ((ri - gi >= 15) & (ri - bi >= 8) & (ri >= 175) & (gi <= 245)).astype(np.uint8) * 255
     mask = strong1 | strong2 | faint
-    ratio = cv2.countNonZero(mask) / float(mask.shape[0] * mask.shape[1])
-    return ratio
+    return cv2.countNonZero(mask) / float(mask.shape[0] * mask.shape[1])
 
 
 def green_signal_ratio(image: np.ndarray) -> float:
-    """Detect green signal used by the animated CF logo."""
     if image is None or image.size == 0:
         return 0.0
-
-    hsv = _bgr_to_hsv(image)
-    green = cv2.inRange(
-        hsv,
-        np.array([35, 120, 60], dtype=np.uint8),
-        np.array([95, 255, 255], dtype=np.uint8),
-    )
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    green = cv2.inRange(hsv, np.array([35, 120, 60], np.uint8), np.array([95, 255, 255], np.uint8))
     return cv2.countNonZero(green) / float(green.shape[0] * green.shape[1])
 
 
 def likely_has_cappersfree_watermark(image: Image.Image) -> bool:
-    """Conservative gate for whether an OpenAI edit is worth attempting."""
-    bgr = cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2BGR)
-    red_ratio = red_signal_ratio(bgr)
-    green_ratio = green_signal_ratio(bgr)
-
-    logger.info(
-        "🔎 Watermark trigger signals | red=%.4f%% green=%.4f%%",
-        red_ratio * 100,
-        green_ratio * 100,
-    )
-
-    # The source branding is known to include strong red text and/or a bright green CF logo.
-    return red_ratio >= 0.00015 or green_ratio >= 0.00008
+    arr = cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2BGR)
+    red = red_signal_ratio(arr)
+    green = green_signal_ratio(arr)
+    logger.info("🔎 Watermark trigger signals | red=%.4f%% green=%.4f%%", red * 100, green * 100)
+    return red >= 0.00015 or green >= 0.00008
 
 
 # ============================================================
-# IMAGE SIZING / PADDING
+# API IMAGE SIZING
 # ============================================================
 
-def _fit_for_image_api(
-    source: Image.Image,
-) -> Tuple[Image.Image, Tuple[int, int], Tuple[int, int, int, int]]:
-    """Prepare an image for GPT image editing using safe canvas sizes.
-
-    The previous beta sent arbitrary dimensions such as 848x528. GPT-Image-2
-    can reject small/custom canvases with a minimum-pixel-budget error.
-
-    We therefore place the complete source image on one of the conservative
-    image-edit canvas sizes below, preserving the source aspect ratio with
-    letterbox padding and cropping the result back afterward.
-
-    Supported canvas choices used here:
-      - landscape: 1536x1024
-      - portrait:  1024x1536
-      - square:    1024x1024
-    """
+def _fit_for_image_api(source: Image.Image) -> Tuple[Image.Image, Tuple[int, int], Tuple[int, int, int, int]]:
     src = source.convert("RGB")
     original_size = src.size
-
-    # Work with a reasonable source maximum before placing it on the API
-    # canvas. This keeps memory/input size under control without cropping.
     max_source_side = 1536
+
     if max(src.size) > max_source_side:
         scale = max_source_side / float(max(src.size))
-        src = src.resize(
-            (
-                max(16, int(round(src.width * scale))),
-                max(16, int(round(src.height * scale))),
-            ),
-            Image.Resampling.LANCZOS,
-        )
+        src = src.resize((max(16, int(round(src.width * scale))), max(16, int(round(src.height * scale)))), Image.Resampling.LANCZOS)
 
     w, h = src.size
     ratio = w / float(h)
-
     if ratio > 1.15:
         canvas = (1536, 1024)
     elif ratio < 0.87:
@@ -204,54 +111,18 @@ def _fit_for_image_api(
     else:
         canvas = (1024, 1024)
 
-    canvas_w, canvas_h = canvas
+    cw, ch = canvas
+    scale = min(cw / float(w), ch / float(h))
+    fw, fh = max(16, int(round(w * scale))), max(16, int(round(h * scale)))
+    fitted = src.resize((fw, fh), Image.Resampling.LANCZOS) if (fw, fh) != (w, h) else src
+    left, top = (cw - fw) // 2, (ch - fh) // 2
 
-    # Fit the complete source inside the canvas without distortion/cropping.
-    scale = min(
-        canvas_w / float(w),
-        canvas_h / float(h),
-    )
-
-    fitted_w = max(16, int(round(w * scale)))
-    fitted_h = max(16, int(round(h * scale)))
-
-    if (fitted_w, fitted_h) != (w, h):
-        fitted = src.resize(
-            (fitted_w, fitted_h),
-            Image.Resampling.LANCZOS,
-        )
-    else:
-        fitted = src
-
-    left = (canvas_w - fitted_w) // 2
-    top = (canvas_h - fitted_h) // 2
-
-    prepared = Image.new(
-        "RGB",
-        canvas,
-        (0, 0, 0),
-    )
-    prepared.paste(
-        fitted,
-        (left, top),
-    )
-
-    # crop_box is the location of the actual source content on the API canvas.
-    crop_box = (
-        left,
-        top,
-        left + fitted_w,
-        top + fitted_h,
-    )
-
-    return prepared, original_size, crop_box
+    prepared = Image.new("RGB", canvas, (0, 0, 0))
+    prepared.paste(fitted, (left, top))
+    return prepared, original_size, (left, top, left + fw, top + fh)
 
 
-def _restore_original_dimensions(
-    edited: Image.Image,
-    original_size: Tuple[int, int],
-    crop_box: Tuple[int, int, int, int],
-) -> Image.Image:
+def _restore_original_dimensions(edited: Image.Image, original_size: Tuple[int, int], crop_box: Tuple[int, int, int, int]) -> Image.Image:
     x1, y1, x2, y2 = crop_box
     cropped = edited.crop((x1, y1, min(x2, edited.width), min(y2, edited.height)))
     if cropped.size != original_size:
@@ -260,155 +131,101 @@ def _restore_original_dimensions(
 
 
 # ============================================================
-# OPENAI EDIT PROMPTS
+# PROMPTS
 # ============================================================
 
 CLEAN_PROMPT = (
-    "Edit this exact source image into a CLEAN VERSION. Search the ENTIRE image, "
-    "not a fixed location, for Cappersfree branding and remove ONLY that branding. "
-    "Remove every visible @cappersfree watermark, including solid bright red text, "
-    "faint/repeating translucent cappersfree text or patterns, and any Cappersfree/CF "
-    "circular logo or graphic. If the watermark overlaps legitimate content, reconstruct "
-    "the hidden pixels so the original content looks natural. Preserve the original "
-    "composition, framing, proportions, sports/betting UI, legitimate logos and icons, "
-    "all non-watermark text, numbers, scores, odds, names, faces, objects, colors, "
-    "lighting and background. Do not crop. Do not redesign. Do not add any text or logo. "
-    "Do not replace the watermark with another brand. Do not alter legitimate red text or "
-    "graphics merely because they are red. The only intended change is complete removal "
-    "of Cappersfree watermark/branding and natural reconstruction underneath it."
+    "Create a clean version of this exact source image. Search the ENTIRE image, "
+    "regardless of watermark position, for all Cappersfree branding and remove only that branding. "
+    "Remove every visible @cappersfree watermark, including solid bright-red text, "
+    "faint/repeating translucent cappersfree text/patterns, and every Cappersfree/CF logo or graphic. "
+    "If branding overlaps legitimate content, reconstruct the hidden pixels naturally from surrounding context. "
+    "Preserve the exact original composition, framing, proportions, sports/betting interface, "
+    "legitimate logos and icons, all legitimate text, numbers, scores, odds, names, faces, objects, "
+    "colors, lighting, and background. Do not crop, redesign, add text, add logos, or replace the watermark "
+    "with another brand. Do not modify legitimate red or green interface elements merely because of their color. "
+    "The only intended change is complete removal of Cappersfree branding and natural reconstruction underneath it."
 )
 
 VARIATION_PROMPT = (
-    "Create a tasteful variation of this already-clean source image while preserving its "
-    "core information and composition. Keep all legitimate text, numbers, teams, odds, "
-    "UI elements and important objects readable and intact. Do not add any Cappersfree, "
-    "@cappersfree, CF logo, watermark, branding, or replacement text. Make only subtle "
-    "visual variations in presentation while keeping the same underlying content."
+    "Create a subtle visual variation of this ALREADY CLEAN image. Keep the same underlying information, "
+    "layout, teams, odds, names, legitimate text, scores, UI elements and important objects. "
+    "Do not add, restore or invent @cappersfree, Cappersfree, CF, or any watermark/branding. "
+    "Do not remove legitimate content. Keep the image immediately recognizable as the same source content."
 )
 
 
 # ============================================================
-# OPENAI REQUEST
+# OPENAI EDIT
 # ============================================================
 
-async def _openai_edit_one(
-    image_bytes: bytes,
-    prompt: str,
-    filename: str,
-) -> Optional[bytes]:
-    global _openai_images_used, _openai_blocked, _openai_block_reason
-
+async def _openai_edit_one(image_bytes: bytes, prompt: str, filename: str) -> Optional[bytes]:
     if client is None:
-        logger.warning("⚠️ OPENAI_API_KEY missing. Skipping AI edit.")
+        logger.error("❌ OPENAI_API_KEY missing or OpenAI package unavailable.")
         return None
-
-    if _openai_blocked:
-        logger.warning(
-            "🛑 OpenAI is disabled for this run: %s. Keeping original.",
-            _openai_block_reason or "previous API failure",
-        )
-        return None
-
-    if _openai_images_used >= MAX_OPENAI_IMAGES_PER_RUN:
-        logger.warning(
-            "🛑 OpenAI image limit reached: %d/%d. Keeping original.",
-            _openai_images_used,
-            MAX_OPENAI_IMAGES_PER_RUN,
-        )
-        return None
-
-    source = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    prepared, original_size, crop_box = _fit_for_image_api(source)
-
-    image_buffer = io.BytesIO()
-    prepared.save(image_buffer, format="PNG")
-    image_buffer.seek(0)
-    image_buffer.name = "input.png"
-
-    requested_size = f"{prepared.width}x{prepared.height}"
-
-    logger.warning(
-        "💰 OpenAI image edit %d/%d | file=%s | quality=%s | size=%s",
-        _openai_images_used + 1,
-        MAX_OPENAI_IMAGES_PER_RUN,
-        filename,
-        OPENAI_IMAGE_QUALITY,
-        requested_size,
-    )
-
-    # Count the attempt BEFORE the network call.
-    # This guarantees the per-run limit cannot be bypassed by failed requests.
-    _openai_images_used += 1
 
     try:
+        source = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        prepared, original_size, crop_box = _fit_for_image_api(source)
+
+        image_buffer = io.BytesIO()
+        prepared.save(image_buffer, format="PNG")
+        image_buffer.seek(0)
+        image_buffer.name = "input.png"
+
+        logger.warning(
+            "💰 OpenAI image edit | file=%s | quality=%s | size=%sx%s",
+            filename,
+            OPENAI_IMAGE_QUALITY,
+            prepared.width,
+            prepared.height,
+        )
+
         response = await client.images.edit(
             model=OPENAI_IMAGE_MODEL,
             image=image_buffer,
             prompt=prompt,
             quality=OPENAI_IMAGE_QUALITY,
-            size=requested_size,
+            size=f"{prepared.width}x{prepared.height}",
             output_format="png",
             n=1,
         )
-    except Exception as exc:
-        status = getattr(exc, "status_code", None)
-        error_text = str(exc)
 
-        if status == 429 or "insufficient_quota" in error_text or "credit_balance_exhausted" in error_text:
-            _openai_blocked = True
-            _openai_block_reason = "quota/credit exhausted or rate limited"
-            logger.error(
-                "🛑 OpenAI disabled for the rest of this run after quota/rate-limit failure: %s",
-                filename,
-            )
-        else:
-            logger.exception("❌ OpenAI image edit failed: %s", filename)
+        if not response.data:
+            logger.error("❌ OpenAI returned no image data: %s", filename)
+            return None
 
-        return None
+        b64 = getattr(response.data[0], "b64_json", None)
+        if not b64:
+            logger.error("❌ OpenAI response contained no b64_json: %s", filename)
+            return None
 
-    if not response.data:
-        logger.error("❌ OpenAI returned no image data: %s", filename)
-        return None
-
-    b64 = getattr(response.data[0], "b64_json", None)
-    if not b64:
-        logger.error("❌ OpenAI response contained no b64_json: %s", filename)
-        return None
-
-    try:
-        edited_bytes = base64.b64decode(b64)
-        edited_img = Image.open(io.BytesIO(edited_bytes)).convert("RGB")
-        restored = _restore_original_dimensions(
-            edited_img,
-            original_size,
-            crop_box,
-        )
+        raw = base64.b64decode(b64)
+        edited = Image.open(io.BytesIO(raw)).convert("RGB")
+        restored = _restore_original_dimensions(edited, original_size, crop_box)
 
         output = io.BytesIO()
         restored.save(output, format="PNG")
         cleaned = output.getvalue()
 
-        logger.info(
-            "✅ Clean image generated: %s | %d bytes",
-            filename,
-            len(cleaned),
-        )
+        logger.info("✅ Clean image generated: %s | %d bytes", filename, len(cleaned))
         return cleaned
 
-    except Exception:
-        logger.exception("❌ Could not decode/restore OpenAI image: %s", filename)
+    except Exception as exc:
+        status = getattr(exc, "status_code", None)
+        message = str(exc)
+        if status == 429 or "insufficient_quota" in message or "credit_balance_exhausted" in message:
+            logger.error("🛑 OpenAI rejected the edit because of quota/rate limits: %s", filename)
+        else:
+            logger.exception("❌ OpenAI image edit failed: %s", filename)
         return None
 
 
 # ============================================================
-# STILL IMAGE CLEANUP
+# STILL IMAGE
 # ============================================================
 
-async def remove_watermarks_from_bytes(
-    image_bytes: bytes,
-    filename: str = "image.jpg",
-) -> Optional[bytes]:
-    """Clean a still image using one OpenAI edit at most during beta."""
+async def remove_watermarks_from_bytes(image_bytes: bytes, filename: str = "image.jpg") -> Optional[bytes]:
     if not image_bytes:
         return None
 
@@ -418,200 +235,117 @@ async def remove_watermarks_from_bytes(
         logger.exception("❌ Could not open still image: %s", filename)
         return None
 
+    # Gate only skips obviously clean images. It is NOT location-based.
     if not likely_has_cappersfree_watermark(source):
-        logger.info(
-            "✅ Local detector found no convincing Cappersfree signal: %s",
-            filename,
-        )
+        logger.info("✅ No convincing Cappersfree signal found: %s", filename)
         return None
 
-    return await _openai_edit_one(
-        image_bytes,
-        CLEAN_PROMPT,
-        filename,
-    )
+    return await _openai_edit_one(image_bytes, CLEAN_PROMPT, filename)
 
 
-async def regenerate_image_from_bytes(
-    image_bytes: bytes,
-    filename: str = "image.jpg",
-) -> Optional[bytes]:
+async def regenerate_image_from_bytes(image_bytes: bytes, filename: str = "image.jpg") -> Optional[bytes]:
     return await remove_watermarks_from_bytes(image_bytes, filename)
 
 
 # ============================================================
-# MOTION -> CLEAN STILL IMAGE
+# MOTION -> ONE CLEAN STILL
 # ============================================================
 
 def _pil_frame_to_png_bytes(frame: Image.Image) -> bytes:
-    output = io.BytesIO()
-    frame.convert("RGB").save(output, format="PNG")
-    return output.getvalue()
+    buf = io.BytesIO()
+    frame.convert("RGB").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _score_frame(frame: Image.Image) -> float:
+    arr = cv2.cvtColor(np.array(frame.convert("RGB")), cv2.COLOR_RGB2BGR)
+    return red_signal_ratio(arr) + 0.8 * green_signal_ratio(arr)
 
 
 def _select_best_gif_frame(gif_bytes: bytes) -> Optional[Image.Image]:
-    """Choose a frame where the watermark is most visible, so one edit can remove it."""
     try:
         source = Image.open(io.BytesIO(gif_bytes))
         count = getattr(source, "n_frames", 1)
-        best_score = -1.0
-        best = None
-
-        for idx in range(count):
+        candidates = sorted(set([0, count // 4, count // 2, max(0, int(count * 0.75)), count - 1]))
+        best_score, best = -1.0, None
+        for idx in candidates:
             source.seek(idx)
-            frame = source.convert("RGB")
-            arr = cv2.cvtColor(np.array(frame), cv2.COLOR_RGB2BGR)
-
-            red = red_signal_ratio(arr)
-            green = green_signal_ratio(arr)
-
-            # Favor frames with the clearest combined watermark signal.
-            score = red * 1.0 + green * 0.8
-            # Middle-ish frames are also preferable to transition frames.
-            mid_penalty = abs((idx / max(1, count - 1)) - 0.55)
-            score -= mid_penalty * 0.0002
-
+            frame = source.convert("RGB").copy()
+            score = _score_frame(frame)
             if score > best_score:
-                best_score = score
-                best = frame.copy()
-
-        if best is None:
-            source.seek(max(0, count // 2))
-            best = source.convert("RGB")
-
-        logger.info(
-            "🎞️ Selected GIF frame for cleanup | frames=%d | score=%.6f",
-            count,
-            best_score,
-        )
+                best_score, best = score, frame
+        logger.info("🎞️ Selected GIF frame for cleanup | frames=%d | score=%.6f", count, best_score)
         return best
-
     except Exception:
         logger.exception("❌ Could not inspect GIF frames")
         return None
 
 
 def _select_best_video_frame(video_bytes: bytes) -> Optional[Image.Image]:
-    """Choose a representative frame with the strongest watermark signal."""
-    import tempfile
-
-    temp_path = None
+    path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as f:
             f.write(video_bytes)
-            temp_path = f.name
-
-        cap = cv2.VideoCapture(temp_path)
+            path = f.name
+        cap = cv2.VideoCapture(path)
         if not cap.isOpened():
-            logger.error("❌ Could not open video for representative-frame extraction")
+            logger.error("❌ Could not open video")
             return None
-
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if frame_count <= 0:
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total <= 0:
             cap.release()
             return None
-
-        sample_indices = sorted(set([
-            int(frame_count * 0.30),
-            int(frame_count * 0.45),
-            int(frame_count * 0.55),
-            int(frame_count * 0.65),
-            int(frame_count * 0.75),
-        ]))
-
-        best_score = -1.0
-        best_frame = None
-
-        for idx in sample_indices:
-            idx = max(0, min(frame_count - 1, idx))
+        candidates = sorted(set([int(total * p) for p in (0.15, 0.30, 0.45, 0.55, 0.65, 0.75, 0.85)]))
+        best_score, best = -1.0, None
+        for idx in candidates:
+            idx = max(0, min(total - 1, idx))
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
             ok, frame = cap.read()
             if not ok:
                 continue
-
-            red = red_signal_ratio(frame)
-            green = green_signal_ratio(frame)
-            score = red * 1.0 + green * 0.8
-
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            image = Image.fromarray(rgb)
+            score = _score_frame(image)
             if score > best_score:
-                best_score = score
-                best_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
+                best_score, best = score, image
         cap.release()
-
-        if best_frame is None:
-            return None
-
-        logger.info(
-            "🎞️ Selected MP4 frame for cleanup | frames=%d | score=%.6f",
-            frame_count,
-            best_score,
-        )
-        return Image.fromarray(best_frame)
-
+        logger.info("🎞️ Selected MP4 frame for cleanup | frames=%d | score=%.6f", total, best_score)
+        return best
     except Exception:
         logger.exception("❌ Could not extract representative MP4 frame")
         return None
-
     finally:
-        if temp_path:
+        if path:
             try:
-                os.remove(temp_path)
+                os.remove(path)
             except OSError:
                 pass
 
 
-async def remove_watermarks_from_gif_bytes(
-    gif_bytes: bytes,
-    filename: str = "animation.gif",
-) -> Optional[bytes]:
-    """Convert GIF to ONE clean still image. No GIF is returned."""
+async def remove_watermarks_from_gif_bytes(gif_bytes: bytes, filename: str = "animation.gif") -> Optional[bytes]:
     frame = _select_best_gif_frame(gif_bytes)
-    if frame is None:
+    if frame is None or not likely_has_cappersfree_watermark(frame):
         return None
-
-    frame_bytes = _pil_frame_to_png_bytes(frame)
-
-    # For the beta, treat the GIF as an intentional watermark-bearing item.
-    # Still use the local gate before spending an OpenAI image edit.
-    try:
-        if not likely_has_cappersfree_watermark(frame):
-            logger.info("✅ GIF representative frame has no convincing watermark signal")
-            return None
-    except Exception:
-        return None
-
     return await _openai_edit_one(
-        frame_bytes,
-        CLEAN_PROMPT + " This source came from an animation; remove the CF logo even if it is a pulsing/scaling frame artifact.",
+        _pil_frame_to_png_bytes(frame),
+        CLEAN_PROMPT + " This is a representative frame from an animation. Remove the pulsing/scaling CF logo completely.",
         filename,
     )
 
 
-async def remove_watermarks_from_video_bytes(
-    video_bytes: bytes,
-    filename: str = "video.mp4",
-) -> Optional[bytes]:
-    """Convert MP4 to ONE clean still PNG. No animation is returned."""
+async def remove_watermarks_from_video_bytes(video_bytes: bytes, filename: str = "video.mp4") -> Optional[bytes]:
     frame = _select_best_video_frame(video_bytes)
-    if frame is None:
+    if frame is None or not likely_has_cappersfree_watermark(frame):
         return None
-
-    frame_bytes = _pil_frame_to_png_bytes(frame)
-
-    if not likely_has_cappersfree_watermark(frame):
-        logger.info("✅ MP4 representative frame has no convincing watermark signal")
-        return None
-
     return await _openai_edit_one(
-        frame_bytes,
-        CLEAN_PROMPT + " This source came from a video/animation; remove any visible or partially-formed pulsing CF logo completely.",
+        _pil_frame_to_png_bytes(frame),
+        CLEAN_PROMPT + " This is a representative frame from a video/animation. Remove the pulsing/scaling CF logo completely.",
         filename,
     )
 
 
 # ============================================================
-# OPTIONAL FOUR-VARIATION STAGE
+# FOUR VARIATIONS
 # ============================================================
 
 async def generate_variations_from_clean_image(
@@ -619,39 +353,25 @@ async def generate_variations_from_clean_image(
     filename: str = "clean.png",
     count: Optional[int] = None,
 ) -> List[bytes]:
-    """Optional second stage. Uses one edit request with n=count.
-
-    Each returned image consumes one image output from the account, so this is
-    intentionally disabled unless GENERATE_VARIATIONS=true.
-    """
-    global _openai_images_used
-
-    if not GENERATE_VARIATIONS:
-        return [clean_image_bytes]
-
-    if client is None:
+    if not GENERATE_VARIATIONS or client is None:
         return [clean_image_bytes]
 
     count = max(1, min(4, count or VARIATION_COUNT))
-    available = MAX_VARIATION_IMAGES_PER_RUN
-    count = min(count, available)
-
-    if BETA_MODE:
-        remaining = max(0, MAX_OPENAI_IMAGES_PER_RUN - _openai_images_used)
-        count = min(count, remaining)
-
-    if count <= 0:
-        logger.warning("🛑 No OpenAI image budget remains for variations.")
-        return [clean_image_bytes]
 
     try:
         source = Image.open(io.BytesIO(clean_image_bytes)).convert("RGB")
         prepared, original_size, crop_box = _fit_for_image_api(source)
-
         image_buffer = io.BytesIO()
         prepared.save(image_buffer, format="PNG")
         image_buffer.seek(0)
         image_buffer.name = "clean.png"
+
+        logger.warning(
+            "💰 OpenAI variations | file=%s | count=%d | quality=%s",
+            filename,
+            count,
+            OPENAI_IMAGE_QUALITY,
+        )
 
         response = await client.images.edit(
             model=OPENAI_IMAGE_MODEL,
@@ -663,33 +383,21 @@ async def generate_variations_from_clean_image(
             n=count,
         )
 
-        returned: List[bytes] = []
+        results: List[bytes] = []
         for item in response.data or []:
             b64 = getattr(item, "b64_json", None)
             if not b64:
                 continue
+            raw = base64.b64decode(b64)
+            img = Image.open(io.BytesIO(raw)).convert("RGB")
+            restored = _restore_original_dimensions(img, original_size, crop_box)
+            out = io.BytesIO()
+            restored.save(out, format="PNG")
+            results.append(out.getvalue())
 
-            try:
-                raw = base64.b64decode(b64)
-                img = Image.open(io.BytesIO(raw)).convert("RGB")
-                restored = _restore_original_dimensions(img, original_size, crop_box)
-                out = io.BytesIO()
-                restored.save(out, format="PNG")
-                returned.append(out.getvalue())
-            except Exception:
-                logger.exception("❌ Failed decoding one variation")
-
-        _openai_images_used += len(returned)
-
-        if returned:
-            logger.info(
-                "✅ Generated %d optional variations for %s",
-                len(returned),
-                filename,
-            )
-            return returned
+        logger.info("✅ Generated %d variations for %s", len(results), filename)
+        return results or [clean_image_bytes]
 
     except Exception:
         logger.exception("❌ Variation generation failed: %s", filename)
-
-    return [clean_image_bytes]
+        return [clean_image_bytes]
