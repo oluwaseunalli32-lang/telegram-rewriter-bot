@@ -6,16 +6,22 @@ from collections import defaultdict
 
 from dotenv import load_dotenv
 
-# Load .env BEFORE importing modules that read environment variables.
+# Load environment before importing ai_processor.
 load_dotenv()
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.tl.types import MessageMediaPhoto, DocumentAttributeFilename
+from telethon.tl.types import (
+    MessageMediaPhoto,
+    DocumentAttributeFilename,
+)
 
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
-from aiogram.types import BufferedInputFile, InputMediaPhoto
+from aiogram.types import (
+    BufferedInputFile,
+    InputMediaPhoto,
+)
 
 import database
 from ai_processor import (
@@ -26,6 +32,7 @@ from ai_processor import (
     generate_variations_from_clean_image,
     GENERATE_VARIATIONS,
     VARIATION_COUNT,
+    get_watermark_profile,
 )
 
 # ============================================================
@@ -37,12 +44,6 @@ API_ID_RAW = os.getenv("API_ID", "").strip()
 API_HASH = os.getenv("API_HASH", "").strip()
 TELEGRAM_SESSION = os.getenv("TELEGRAM_SESSION", "").strip()
 
-# New multi-channel setting.
-# Example:
-# SOURCE_CHANNELS=-1001111111111,-1002222222222,-1003333333333
-#
-# Backward-compatible: if SOURCE_CHANNELS is not set, the old
-# SOURCE_CHANNEL value is used.
 SOURCE_CHANNELS_RAW = os.getenv("SOURCE_CHANNELS", "").strip()
 
 if SOURCE_CHANNELS_RAW:
@@ -60,6 +61,7 @@ if SOURCE_CHANNELS_RAW:
         if channel_id not in SOURCE_CHANNELS:
             SOURCE_CHANNELS.append(channel_id)
 else:
+    # Backward compatibility with the old single-channel variable.
     SOURCE_CHANNELS = [
         int(os.getenv("SOURCE_CHANNEL", "-1003593544389"))
     ]
@@ -67,6 +69,7 @@ else:
 TARGET_CHANNEL = int(
     os.getenv("TARGET_CHANNEL", "-1004415621706")
 )
+
 POLL_INTERVAL = max(
     1,
     int(os.getenv("POLL_INTERVAL", "3")),
@@ -77,11 +80,20 @@ try:
 except ValueError:
     API_ID = 0
 
+# ============================================================
+# LOGGING
+# ============================================================
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
+
 logger = logging.getLogger(__name__)
+
+# ============================================================
+# TELEGRAM CLIENT
+# ============================================================
 
 if not TELEGRAM_SESSION:
     user_client = None
@@ -125,6 +137,10 @@ def validate_environment():
         raise RuntimeError("TELEGRAM_SESSION is missing.")
     if not SOURCE_CHANNELS:
         raise RuntimeError("SOURCE_CHANNELS is empty.")
+    if not TARGET_CHANNEL:
+        raise RuntimeError("TARGET_CHANNEL is missing.")
+    if not os.getenv("OPENAI_API_KEY", "").strip():
+        raise RuntimeError("OPENAI_API_KEY is missing.")
 
 
 # ============================================================
@@ -156,10 +172,8 @@ def get_media_type(message):
 
         if mime == "image/gif":
             return "animation"
-
         if mime.startswith("video/"):
             return "video"
-
         if mime.startswith("image/"):
             return "image"
 
@@ -189,10 +203,7 @@ def get_media_type(message):
 
 async def download_media(message):
     buf = io.BytesIO()
-    await user_client.download_media(
-        message,
-        file=buf,
-    )
+    await user_client.download_media(message, file=buf)
     return buf.getvalue()
 
 
@@ -209,11 +220,7 @@ async def prepare_caption(message):
 # CLEAN + POST
 # ============================================================
 
-async def post_clean_outputs(
-    clean_bytes,
-    caption,
-    filename,
-):
+async def post_clean_outputs(clean_bytes, caption, filename):
     if not clean_bytes:
         return False
 
@@ -256,22 +263,24 @@ async def send_single(message, source_channel):
         )
 
         logger.info(
-            "📨 New source message %s | source=%s | type=%s | file=%s",
+            "📨 New source message %s | source=%s | profile=%s | type=%s | file=%s",
             message.id,
             source_channel,
+            get_watermark_profile(source_channel),
             media_type,
             get_filename(message),
         )
 
+        # --------------------------------------------------------
+        # TEXT ONLY
+        # --------------------------------------------------------
         if not message.media:
             caption = await prepare_caption(message)
-
             if caption:
                 await bot.send_message(
                     TARGET_CHANNEL,
                     caption,
                 )
-
             return True
 
         filename = get_filename(message)
@@ -294,6 +303,7 @@ async def send_single(message, source_channel):
             cleaned = await remove_watermarks_from_bytes(
                 original,
                 filename,
+                source_channel,
             )
 
             if cleaned:
@@ -308,7 +318,6 @@ async def send_single(message, source_channel):
                     filename,
                 )
 
-            # No convincing watermark signal, or cleanup failed.
             logger.info(
                 "📌 Posting original still for %s from %s",
                 message.id,
@@ -332,11 +341,13 @@ async def send_single(message, source_channel):
             cleaned = await remove_watermarks_from_gif_bytes(
                 original,
                 filename,
+                source_channel,
             )
         elif media_type == "video":
             cleaned = await remove_watermarks_from_video_bytes(
                 original,
                 filename,
+                source_channel,
             )
         else:
             cleaned = None
@@ -354,8 +365,6 @@ async def send_single(message, source_channel):
                     filename,
                 )
 
-            # Do NOT repost GIF/video because the desired behavior is a
-            # clean still output.
             logger.warning(
                 "⚠️ Motion %s from %s could not be converted to a clean still; "
                 "original motion is NOT reposted.",
@@ -386,10 +395,21 @@ async def send_single(message, source_channel):
         return False
 
 
+# ============================================================
+# ALBUM PROCESSING
+# ============================================================
+
 async def process_album(messages, source_channel):
     messages = sorted(
         messages,
         key=lambda m: m.id,
+    )
+
+    logger.info(
+        "📦 Processing album from %s | %d items | profile=%s",
+        source_channel,
+        len(messages),
+        get_watermark_profile(source_channel),
     )
 
     caption = None
@@ -421,6 +441,7 @@ async def process_album(messages, source_channel):
             cleaned = await remove_watermarks_from_bytes(
                 original,
                 filename,
+                source_channel,
             )
             final = cleaned or original
             photo_outputs.append((final, filename))
@@ -429,8 +450,8 @@ async def process_album(messages, source_channel):
             cleaned = await remove_watermarks_from_gif_bytes(
                 original,
                 filename,
+                source_channel,
             )
-
             if not cleaned:
                 return False
 
@@ -445,8 +466,8 @@ async def process_album(messages, source_channel):
             cleaned = await remove_watermarks_from_video_bytes(
                 original,
                 filename,
+                source_channel,
             )
-
             if not cleaned:
                 return False
 
@@ -468,6 +489,7 @@ async def process_album(messages, source_channel):
             )
             caption = None
 
+    # Telegram media groups max out at 10 photos.
     if photo_outputs:
         for start in range(0, len(photo_outputs), 10):
             chunk = photo_outputs[start:start + 10]
@@ -480,7 +502,11 @@ async def process_album(messages, source_channel):
                             image_bytes,
                             filename="clean.png",
                         ),
-                        caption=caption if idx == 0 else None,
+                        caption=(
+                            caption
+                            if idx == 0
+                            else None
+                        ),
                     )
                 )
 
@@ -488,13 +514,14 @@ async def process_album(messages, source_channel):
                 TARGET_CHANNEL,
                 media=group,
             )
+
             caption = None
 
     return True
 
 
 # ============================================================
-# DATABASE STATE -- PER SOURCE CHANNEL
+# DATABASE STATE -- ONE POSITION PER SOURCE
 # ============================================================
 
 def get_last_processed(source_channel):
@@ -504,8 +531,7 @@ def get_last_processed(source_channel):
         )
     except Exception:
         logger.exception(
-            "⚠️ Could not read last processed message "
-            "for source %s.",
+            "⚠️ Could not read last processed message for source %s",
             source_channel,
         )
         return None
@@ -519,8 +545,7 @@ def set_last_processed(source_channel, message_id):
         )
     except Exception:
         logger.exception(
-            "⚠️ Could not save last processed message ID %s "
-            "for source %s.",
+            "⚠️ Could not save last processed ID %s for source %s",
             message_id,
             source_channel,
         )
@@ -528,15 +553,12 @@ def set_last_processed(source_channel, message_id):
 
 
 # ============================================================
-# ONE SOURCE CHANNEL POLLER
+# ONE SOURCE POLLER
 # ============================================================
 
 async def process_channel(source_channel):
     last_id = get_last_processed(source_channel)
 
-    # --------------------------------------------------------
-    # FIRST RUN FOR THIS SOURCE
-    # --------------------------------------------------------
     if last_id is None:
         latest = await user_client.get_messages(
             source_channel,
@@ -558,14 +580,12 @@ async def process_channel(source_channel):
             )
 
     logger.info(
-        "📡 Polling source %s starting after %s",
+        "📡 Polling source %s starting after %s | profile=%s",
         source_channel,
         last_id or 0,
+        get_watermark_profile(source_channel),
     )
 
-    # --------------------------------------------------------
-    # POLLING LOOP
-    # --------------------------------------------------------
     while True:
         try:
             messages = await user_client.get_messages(
@@ -577,7 +597,7 @@ async def process_channel(source_channel):
 
             if messages:
                 logger.info(
-                    "📨 Found %d new source message(s) in %s.",
+                    "📨 Found %d new source message(s) in %s",
                     len(messages),
                     source_channel,
                 )
@@ -591,8 +611,6 @@ async def process_channel(source_channel):
                     else:
                         normal.append(msg)
 
-                # Preserve chronological order across normal messages
-                # and albums.
                 work = [
                     (
                         min(m.id for m in group),
@@ -611,21 +629,17 @@ async def process_channel(source_channel):
                     for msg in normal
                 ]
 
-                work.sort(
-                    key=lambda item: item[0]
-                )
+                work.sort(key=lambda item: item[0])
 
                 for _, kind, payload in work:
                     if kind == "single":
                         msg = payload
 
                         logger.info(
-                            "➡️ Processing source=%s message=%s (%s)",
-                            source_channel,
+                            "➡️ Processing message %s from source %s (%s)",
                             msg.id,
-                            get_media_type(msg)
-                            if msg.media
-                            else "text",
+                            source_channel,
+                            get_media_type(msg) if msg.media else "text",
                         )
 
                         ok = await send_single(
@@ -644,24 +658,22 @@ async def process_channel(source_channel):
                             )
                         else:
                             logger.warning(
-                                "⏸️ Source %s message %s remains pending "
-                                "because processing/posting failed.",
-                                source_channel,
+                                "⏸️ Message %s from %s remains pending because posting failed.",
                                 msg.id,
+                                source_channel,
                             )
                             break
 
                     else:
                         group = payload
                         first = min(
-                            m.id
-                            for m in group
+                            m.id for m in group
                         )
 
                         logger.info(
-                            "➡️ Processing source=%s album starting at message %s (%d items)",
-                            source_channel,
+                            "➡️ Processing album starting at %s from source %s (%d items)",
                             first,
+                            source_channel,
                             len(group),
                         )
 
@@ -681,10 +693,9 @@ async def process_channel(source_channel):
                             )
                         else:
                             logger.warning(
-                                "⏸️ Source %s album starting at %s remains pending "
-                                "because processing/posting failed.",
-                                source_channel,
+                                "⏸️ Album starting at %s from %s remains pending because posting failed.",
                                 first,
+                                source_channel,
                             )
                             break
 
@@ -695,7 +706,7 @@ async def process_channel(source_channel):
 
         except Exception:
             logger.exception(
-                "❌ Polling loop error for source %s",
+                "❌ Polling error for source %s",
                 source_channel,
             )
             await asyncio.sleep(POLL_INTERVAL)
@@ -711,61 +722,61 @@ async def main():
     logger.info(
         "🚀 Starting Telegram Image Recreation Bot..."
     )
+
     logger.info(
         "📌 Sources (%d): %s",
         len(SOURCE_CHANNELS),
-        ", ".join(str(x) for x in SOURCE_CHANNELS),
+        SOURCE_CHANNELS,
     )
+
     logger.info(
         "📌 Target: %s",
         TARGET_CHANNEL,
     )
+
     logger.info(
         "🔐 Telegram authentication: StringSession"
     )
+
     logger.info(
         "🧹 Watermark removal: ENABLED"
     )
+
     logger.info(
-        "🖼️ Still images: location-independent watermark search"
+        "🖼️ Still images: full-image, location-independent search"
     )
+
     logger.info(
-        "🎞️ GIF/MP4: representative frame -> ONE clean still image"
+        "🎞️ GIF/MP4: representative frame -> ONE clean still"
     )
+
     logger.info(
         "🚫 GIF/MP4 will NOT be reposted as animation"
     )
+
     logger.info(
-        "📝 Caption: remove '*' + replace @cappersfree only"
+        "📝 Caption: remove '*' + replace @cappersfree/@pickssman"
     )
+
     logger.info(
-        "♾️ OpenAI application image limit: NONE"
+        "♾️ OpenAI application image-count limit: NONE"
     )
+
     logger.info(
         "🧩 Four variations: %s (count=%d)",
         "ON" if GENERATE_VARIATIONS else "OFF",
         VARIATION_COUNT,
     )
+
     logger.info(
         "🎨 OpenAI quality: %s",
         os.getenv("OPENAI_IMAGE_QUALITY", "low"),
     )
+
     logger.info(
         "🤖 OpenAI model: %s",
         os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2"),
     )
-
-    if not os.getenv("OPENAI_API_KEY", "").strip():
-        raise RuntimeError(
-            "OPENAI_API_KEY is missing. "
-            "This production version requires OpenAI for cleanup."
-        )
-
-    if user_client is None:
-        raise RuntimeError(
-            "Telegram user client could not be created because "
-            "TELEGRAM_SESSION is missing."
-        )
 
     await user_client.connect()
 
@@ -782,53 +793,54 @@ async def main():
         me.first_name or "",
         me.username or "",
     )
+
     logger.info(
         "✅ Telegram user client connected!"
     )
 
-    # --------------------------------------------------------
-    # VERIFY EVERY SOURCE AND TARGET
-    # --------------------------------------------------------
+    # Resolve every source and target before starting the pollers.
     for source_channel in SOURCE_CHANNELS:
-        source_entity = await user_client.get_entity(
-            source_channel
-        )
-        logger.info(
-            "✅ Source resolved: %s | %s",
+        entity = await user_client.get_entity(
             source_channel,
-            getattr(
-                source_entity,
-                "title",
-                None,
-            ) or source_channel,
+        )
+
+        logger.info(
+            "✅ Source resolved: %s | id=%s | profile=%s",
+            getattr(entity, "title", None) or source_channel,
+            source_channel,
+            get_watermark_profile(source_channel),
         )
 
     target_entity = await user_client.get_entity(
-        TARGET_CHANNEL
-    )
-    logger.info(
-        "✅ Target resolved: %s | %s",
         TARGET_CHANNEL,
-        getattr(
-            target_entity,
-            "title",
-            None,
-        ) or TARGET_CHANNEL,
     )
 
-    # --------------------------------------------------------
-    # RUN ALL SOURCE POLLERS CONCURRENTLY
-    # Each source has its own database position.
-    # --------------------------------------------------------
+    logger.info(
+        "✅ Target resolved: %s | id=%s",
+        getattr(target_entity, "title", None) or TARGET_CHANNEL,
+        TARGET_CHANNEL,
+    )
+
+    # One independent poller per source channel.
+    tasks = [
+        asyncio.create_task(
+            process_channel(source_channel),
+            name=f"source-{source_channel}",
+        )
+        for source_channel in SOURCE_CHANNELS
+    ]
+
     try:
+        await asyncio.gather(*tasks)
+    finally:
+        for task in tasks:
+            task.cancel()
+
         await asyncio.gather(
-            *(
-                process_channel(source_channel)
-                for source_channel in SOURCE_CHANNELS
-            )
+            *tasks,
+            return_exceptions=True,
         )
 
-    finally:
         try:
             await user_client.disconnect()
         except Exception:
@@ -840,17 +852,11 @@ async def main():
             pass
 
 
-# ============================================================
-# RUN
-# ============================================================
-
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-
     except KeyboardInterrupt:
         logger.info("🛑 Bot stopped.")
-
     except Exception:
         logger.exception("💥 Fatal startup error.")
         raise
