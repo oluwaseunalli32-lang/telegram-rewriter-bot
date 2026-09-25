@@ -798,11 +798,25 @@ async def main():
         "✅ Telegram user client connected!"
     )
 
-    # Resolve every source and target before starting the pollers.
+    # Resolve every source before starting the pollers.
+    # If a configured source no longer exists or is inaccessible, skip it
+    # instead of crashing the entire bot.
+    active_source_channels = []
+
     for source_channel in SOURCE_CHANNELS:
-        entity = await user_client.get_entity(
-            source_channel,
-        )
+        try:
+            entity = await user_client.get_entity(
+                source_channel,
+            )
+        except Exception as exc:
+            logger.error(
+                "⚠️ Source %s could not be resolved and will be skipped: %s",
+                source_channel,
+                exc,
+            )
+            continue
+
+        active_source_channels.append(source_channel)
 
         logger.info(
             "✅ Source resolved: %s | id=%s | profile=%s",
@@ -810,6 +824,18 @@ async def main():
             source_channel,
             get_watermark_profile(source_channel),
         )
+
+    if not active_source_channels:
+        raise RuntimeError(
+            "None of the configured SOURCE_CHANNELS could be resolved. "
+            "Check the channel IDs and Telegram account access."
+        )
+
+    logger.info(
+        "📌 Active sources (%d): %s",
+        len(active_source_channels),
+        active_source_channels,
+    )
 
     target_entity = await user_client.get_entity(
         TARGET_CHANNEL,
@@ -821,13 +847,13 @@ async def main():
         TARGET_CHANNEL,
     )
 
-    # One independent poller per source channel.
+    # One independent poller per active source channel.
     tasks = [
         asyncio.create_task(
             process_channel(source_channel),
             name=f"source-{source_channel}",
         )
-        for source_channel in SOURCE_CHANNELS
+        for source_channel in active_source_channels
     ]
 
     try:
