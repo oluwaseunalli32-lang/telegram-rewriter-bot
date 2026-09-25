@@ -30,14 +30,15 @@ GENERATE_VARIATIONS = os.getenv("GENERATE_VARIATIONS", "true").strip().lower() i
 }
 VARIATION_COUNT = max(1, min(4, int(os.getenv("VARIATION_COUNT", "4"))))
 
-NEW_MENTION = os.getenv("NEW_MENTION", "@PrimeAnalysiss").strip()
-if NEW_MENTION and not NEW_MENTION.startswith("@"):
-    NEW_MENTION = "@" + NEW_MENTION
+# Caption handling: source/target mentions are removed entirely.
+# NEW_MENTION is intentionally ignored for captions so no replacement mention
+# is inserted into reposted captions.
+NEW_MENTION = os.getenv("NEW_MENTION", "").strip()
 
-# Caption replacements: do not rewrite anything else.
 CAPTION_MENTIONS = (
     "@cappersfree",
     "@pickssman",
+    "@PrimeAnalysiss",
 )
 
 # Optional source-specific watermark style.
@@ -68,18 +69,40 @@ client = (
 # ============================================================
 
 def replace_username(text: Optional[str]) -> Optional[str]:
+    """Remove source/target mentions without changing other caption text.
+
+    Also removes short call-to-action fragments such as "DM to @username"
+    when the username is one of the configured source/target mentions.
+    """
     if not text:
         return text
 
     result = text.replace("*", "")
-    for mention in CAPTION_MENTIONS:
-        result = re.sub(
-            re.escape(mention),
-            NEW_MENTION,
-            result,
-            flags=re.IGNORECASE,
-        )
-    return result
+
+    mention_pattern = "(?:" + "|".join(re.escape(m) for m in CAPTION_MENTIONS) + ")"
+
+    # Remove CTA phrases tied directly to the configured mentions.
+    result = re.sub(
+        rf"\b(?:dm|direct\s+message|message|contact)\s+(?:to\s+|me\s+|us\s+|the\s+)?{mention_pattern}\b",
+        "",
+        result,
+        flags=re.IGNORECASE,
+    )
+
+    # Remove the mentions themselves.
+    result = re.sub(
+        mention_pattern,
+        "",
+        result,
+        flags=re.IGNORECASE,
+    )
+
+    # Remove extra whitespace created by deleting a mention/CTA, but otherwise
+    # leave the original caption wording and punctuation alone.
+    result = re.sub(r"[ \t]{2,}", " ", result)
+    result = re.sub(r"[ \t]+\n", "\n", result)
+    result = re.sub(r"\n[ \t]+", "\n", result)
+    return result.strip()
 
 
 async def rewrite_text(original_text: Optional[str]) -> Optional[str]:
