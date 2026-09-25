@@ -755,7 +755,7 @@ async def main():
     )
 
     logger.info(
-        "📝 Caption: remove '*' + replace @cappersfree/@pickssman"
+        "📝 Caption: remove '*' + remove source/target mentions"
     )
 
     logger.info(
